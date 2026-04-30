@@ -33,5 +33,6 @@ VENUES: dict[str, dict] = {
 DEFAULT_MIN_ABS_APY_PCT = 100.0          # |APY_norm| >= 100%
 DEFAULT_MIN_VOLUME_24H_USD = 1_000_000   # $1M 24h notional
 DEFAULT_MIN_PERSISTENCE = 3              # consecutive observations
-DEFAULT_BASIS_COST_BPS = 20.0            # round-trip basis assumption
+DEFAULT_EXIT_BASIS_BPS = 0.0             # assume price convergence at unwind
 DEFAULT_TAKER_FEE_BPS = 5.0              # per leg per side
+DEFAULT_MIN_SPREAD_APY_PCT = 50.0        # min cross-venue annualized spread for breakeven view

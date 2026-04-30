@@ -72,49 +72,79 @@ def anomaly_candidates(min_abs_apy_pct: float, min_volume_usd: float, min_persis
 
 
 def breakeven_epochs(
-    min_abs_delta_apy_pct: float,
+    min_spread_apy_pct: float,
     min_volume_usd: float,
-    basis_cost_bps: float,
+    exit_basis_bps: float,
     taker_fee_bps: float,
 ):
-    """Rank candidate venue-pairs by E_BE = (basis_cost + 2*taker_fee) / yield_per_epoch.
+    """Rank candidate venue-pairs by E_BE = (basis_cost + fee_cost) / yield_per_epoch.
+
+    Entry basis is computed live from the mark-price spread between venues:
+        entry_basis_bps = 10000 * (mark_short - mark_long) / mid_mark
+    Positive entry basis = favorable entry (short price > long price means you
+    sell high and buy low, pocketing the spread on convergence).
+
+    Round-trip costs:
+        basis_cost_bps = exit_basis_bps - entry_basis_bps  (negative if favorable)
+        fee_cost_bps   = 4 * taker_fee_bps                  (entry + exit, both legs)
 
     Yield-per-epoch uses the SHORT leg's interval (the high-collecting side).
-    Mismatched intervals are flagged via interval_mismatch but math assumes
-    the short-leg cadence; refine in research notebook if needed.
+    Interval mismatch is surfaced as a column; refine in the research layer if needed.
     """
     sql = f"""
     WITH latest AS (
         SELECT symbol_canonical, exchange, apy_norm, funding_rate,
-               funding_interval_h, volume_24h_usd,
+               funding_interval_h, mark_price, volume_24h_usd,
                ROW_NUMBER() OVER (PARTITION BY symbol_canonical, exchange ORDER BY ts_utc DESC) AS rn
         FROM funding
         WHERE volume_24h_usd >= ?
           AND apy_norm IS NOT NULL
+          AND mark_price IS NOT NULL
     ),
-    snap AS (SELECT * FROM latest WHERE rn = 1)
+    snap AS (SELECT * FROM latest WHERE rn = 1),
+    pairs AS (
+        SELECT
+            s.symbol_canonical,
+            l.exchange       AS long_venue,
+            s.exchange       AS short_venue,
+            l.apy_norm       AS long_apy,
+            s.apy_norm       AS short_apy,
+            l.funding_interval_h AS long_interval_h,
+            s.funding_interval_h AS short_interval_h,
+            l.mark_price     AS long_mark,
+            s.mark_price     AS short_mark,
+            LEAST(s.volume_24h_usd, l.volume_24h_usd) AS min_volume_24h_usd
+        FROM snap s
+        JOIN snap l
+          ON s.symbol_canonical = l.symbol_canonical
+         AND s.exchange <> l.exchange
+         AND s.apy_norm > l.apy_norm
+    )
     SELECT
-        s.symbol_canonical,
-        l.exchange                                                       AS long_venue,
-        s.exchange                                                       AS short_venue,
-        100.0 * (s.apy_norm - l.apy_norm)                                AS spread_apy_pct,
-        s.funding_interval_h                                             AS short_interval_h,
-        l.funding_interval_h                                             AS long_interval_h,
-        (s.funding_interval_h <> l.funding_interval_h)                   AS interval_mismatch,
-        ({basis_cost_bps} + 2 * {taker_fee_bps})
-          / NULLIF(10000.0 * (s.apy_norm - l.apy_norm) * s.funding_interval_h / {EPOCHS_PER_YEAR}, 0)
-                                                                         AS breakeven_epochs,
-        LEAST(s.volume_24h_usd, l.volume_24h_usd)                        AS min_volume_24h_usd
-    FROM snap s
-    JOIN snap l
-      ON s.symbol_canonical = l.symbol_canonical
-     AND s.exchange <> l.exchange
-     AND s.apy_norm > l.apy_norm                  -- s = short the high, l = long the low
-    WHERE 100.0 * (s.apy_norm - l.apy_norm) >= ?
+        symbol_canonical,
+        long_venue,
+        short_venue,
+        100.0 * (short_apy - long_apy)                                    AS spread_apy_pct,
+        short_interval_h,
+        long_interval_h,
+        (short_interval_h <> long_interval_h)                             AS interval_mismatch,
+        long_mark,
+        short_mark,
+        10000.0 * (short_mark - long_mark) / ((short_mark + long_mark) / 2.0)
+                                                                          AS entry_basis_bps,
+        (
+            ({exit_basis_bps}
+             - 10000.0 * (short_mark - long_mark) / ((short_mark + long_mark) / 2.0))
+            + 4.0 * {taker_fee_bps}
+        ) / NULLIF(10000.0 * (short_apy - long_apy) * short_interval_h / {EPOCHS_PER_YEAR}, 0)
+                                                                          AS breakeven_epochs,
+        min_volume_24h_usd
+    FROM pairs
+    WHERE 100.0 * (short_apy - long_apy) >= ?
     ORDER BY breakeven_epochs ASC NULLS LAST
     LIMIT 200;
     """
-    return sql, [min_volume_usd, min_abs_delta_apy_pct]
+    return sql, [min_volume_usd, min_spread_apy_pct]
 
 
 def historical_funding(symbol: str, exchanges: list[str], hours_back: int | None = None):
