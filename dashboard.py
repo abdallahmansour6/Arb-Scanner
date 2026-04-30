@@ -250,10 +250,18 @@ with tab_be:
             "**Entry basis** is computed live from the mark-price spread between the two venues: "
             "`entry_basis_bps = 10000 × (mark_short − mark_long) / mid_mark`. "
             "Positive = favorable entry (sell high, buy low). Negative = you pay the spread on entry.\n\n"
-            "**Sanity check on entry basis:** healthy cross-venue mark spreads on liquid pairs sit within "
-            "~1–20 bps. Anything above ~100 bps usually indicates stale data on one venue or an illiquid "
-            "pair whose price discovery hasn't converged — *not* a real arb, since you can't trade size at "
-            "those quotes. The **Max |entry basis|** filter below excludes those (default 100 bps).\n\n"
+            "**Why this column tends to skew positive in your data:** the SQL orients each pair so "
+            "`short_venue = higher-APY-venue`. In funding-anomaly pairs, the high-APY venue typically "
+            "*also* has the higher mark price (longs paying funding heavily ↔ bullish demand ↔ price "
+            "ran up there) — so most pairs come out with positive entry basis. Negatives exist; lower "
+            "Min spread APY or sort the column ascending to surface them.\n\n"
+            "**Two independent entry-basis filters** (below) — split because the sign carries meaning:\n"
+            "- **Min entry basis** filters by *trade quality*. Set e.g. `−50` to exclude pairs where "
+            "you'd pay more than 50 bps to enter; set `0` to require strictly favorable entries.\n"
+            "- **Max entry basis** filters by *data quality*. Set e.g. `100` to exclude implausibly "
+            "large positive spreads (usually stale prices on one leg, not real arb you can capture).\n"
+            "Either or both can be left empty (no filter on that side). They're *not* the same as "
+            "filtering by `|entry_basis|` — that conflated the two purposes.\n\n"
             "**Exit basis** defaults to 0 — the standard delta-neutral assumption is price convergence at "
             "unwind. Use the slider to stress-test imperfect convergence.\n\n"
             "**Round-trip cost** = `(exit_basis − entry_basis) + 4 × taker_fee_bps` (4 = entry + exit, "
@@ -296,27 +304,39 @@ with tab_be:
             help="Cross-venue annualized APY gap required to even consider the pair.",
             key="be_min_spread",
         )
-    c4, c5, c6 = st.columns(3)
+    c4, c5, c6, c7 = st.columns(4)
     with c4:
-        max_abs_entry_basis_bps = st.number_input(
-            "Max |entry basis| (bps) — 0 disables",
-            min_value=0.0, value=0.0, step=10.0,
+        min_entry_basis_bps = st.number_input(
+            "Min entry basis (bps)",
+            value=None, step=10.0, format="%.1f",
+            placeholder="No minimum",
             help=(
-                "Optional. **0 = filter disabled**, all pairs shown. Set a value to exclude "
-                "rows where |entry basis| exceeds it; e.g. 100 to drop pairs with mark spreads "
-                "above 1% (usually stale prices or illiquid discovery), or 20 if you only want "
-                "tightly-tradeable basis."
+                "**Trade-quality lower bound.** Empty = no filter. "
+                "Set −50 to exclude pairs where you'd pay more than 50 bps on entry. "
+                "Set 0 to require strictly favorable entries (short_mark > long_mark)."
             ),
-            key="be_max_abs_entry_basis",
+            key="be_min_entry_basis",
         )
     with c5:
+        max_entry_basis_bps = st.number_input(
+            "Max entry basis (bps)",
+            value=None, step=10.0, format="%.1f",
+            placeholder="No maximum",
+            help=(
+                "**Data-quality upper bound.** Empty = no filter. "
+                "Set 100 to exclude implausibly large favorable spreads (>1% mark gap usually "
+                "means stale prices on one leg, not a capturable arb)."
+            ),
+            key="be_max_entry_basis",
+        )
+    with c6:
         taker_fee_bps = st.number_input(
             "Taker fee per side (bps)",
             value=DEFAULT_TAKER_FEE_BPS, step=0.5, min_value=0.0,
             help="Used 4× in the cost (entry + exit, both legs).",
             key="be_taker_fee",
         )
-    with c6:
+    with c7:
         exit_basis_bps = st.number_input(
             "Residual exit basis (bps)",
             value=DEFAULT_EXIT_BASIS_BPS, step=1.0,
@@ -328,7 +348,9 @@ with tab_be:
         )
 
     sql, params = analytics.breakeven_epochs(
-        min_spread_apy, min_vol_be, exit_basis_bps, taker_fee_bps, min_oi_be, max_abs_entry_basis_bps,
+        min_spread_apy, min_vol_be, exit_basis_bps, taker_fee_bps, min_oi_be,
+        min_entry_basis_bps=min_entry_basis_bps,
+        max_entry_basis_bps=max_entry_basis_bps,
     )
     df = cached_query(sql, tuple(params))
     if df.empty:

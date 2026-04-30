@@ -90,8 +90,10 @@ def breakeven_epochs(
     exit_basis_bps: float,
     taker_fee_bps: float,
     min_oi_usd: float = 0.0,
-    max_abs_entry_basis_bps: float = 0.0,   # 0 = filter disabled
+    min_entry_basis_bps: float | None = None,   # None = no lower bound
+    max_entry_basis_bps: float | None = None,   # None = no upper bound
     basis_history_hours: int = 1,
+    limit: int = 1000,
 ):
     """Rank candidate venue-pairs by E_BE = (basis_cost + fee_cost) / yield_per_epoch.
 
@@ -107,9 +109,12 @@ def breakeven_epochs(
     Yield-per-epoch uses the SHORT leg's interval (the high-collecting side).
     Interval mismatch is surfaced as a column; refine in the research layer if needed.
     """
-    # If user passes 0, bypass the basis filter by setting threshold to a value
-    # nothing realistic will exceed. Don't filter unless the user opted in.
-    basis_threshold = max_abs_entry_basis_bps if max_abs_entry_basis_bps > 0 else 1e18
+    # Bypass each bound when the user hasn't set it (None). Sentinels chosen so
+    # nothing realistic crosses them. Min and max are independent signed filters:
+    # min for trade quality (cap unfavorable entries), max for data quality
+    # (cap implausibly large favorables). The two purposes are distinct.
+    min_eb_threshold = min_entry_basis_bps if min_entry_basis_bps is not None else -1e18
+    max_eb_threshold = max_entry_basis_bps if max_entry_basis_bps is not None else 1e18
 
     sql = f"""
     WITH latest AS (
@@ -197,11 +202,12 @@ def breakeven_epochs(
      AND LEAST(p.long_venue, p.short_venue) = bh.venue_lo
      AND GREATEST(p.long_venue, p.short_venue) = bh.venue_hi
     WHERE 100.0 * (p.short_apy - p.long_apy) >= ?
-      AND ABS(10000.0 * (p.short_mark - p.long_mark) / ((p.short_mark + p.long_mark) / 2.0)) <= ?
+      AND (10000.0 * (p.short_mark - p.long_mark) / ((p.short_mark + p.long_mark) / 2.0)) >= ?
+      AND (10000.0 * (p.short_mark - p.long_mark) / ((p.short_mark + p.long_mark) / 2.0)) <= ?
     ORDER BY breakeven_epochs ASC NULLS LAST
-    LIMIT 200;
+    LIMIT {int(limit)};
     """
-    return sql, [min_volume_usd, min_oi_usd, min_spread_apy_pct, basis_threshold]
+    return sql, [min_volume_usd, min_oi_usd, min_spread_apy_pct, min_eb_threshold, max_eb_threshold]
 
 
 def historical_funding(symbol: str, exchanges: list[str], hours_back: int | None = None):
