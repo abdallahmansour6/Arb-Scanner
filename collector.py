@@ -114,6 +114,14 @@ def _ccxt_symbol_for(client, venue_symbol: str | None) -> str | None:
     return markets[0].get("symbol") if markets else None
 
 
+_BITMART_URLS = (
+    # v2 host is the documented home for Bitmart Futures v2 since 2024;
+    # v1 host is kept as a fallback in case of routing changes.
+    "https://api-cloud-v2.bitmart.com/contract/public/details",
+    "https://api-cloud.bitmart.com/contract/public/details",
+)
+
+
 async def _native_bitmart(client, cycle_ts: datetime, canonical: str) -> list[dict]:
     """Single GET to /contract/public/details — replaces tickers + per-symbol funding + OI.
 
@@ -121,7 +129,16 @@ async def _native_bitmart(client, cycle_ts: datetime, canonical: str) -> list[di
     turnover_24h (USD), last_price, funding_interval_hours, and
     next_funding_rate_timestamp in one round-trip.
     """
-    raw = await _http_get_json("https://api-cloud.bitmart.com/contract/public/details")
+    raw = None
+    last_err: Exception | None = None
+    for url in _BITMART_URLS:
+        try:
+            raw = await _http_get_json(url)
+            break
+        except Exception as e:
+            last_err = e
+    if raw is None:
+        raise RuntimeError(f"all bitmart endpoints failed: {last_err}")
     rows: list[dict] = []
     payload = (raw or {}).get("data") or {}
     for s in payload.get("symbols") or []:
