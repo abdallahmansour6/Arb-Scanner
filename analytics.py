@@ -87,6 +87,7 @@ def breakeven_epochs(
     exit_basis_bps: float,
     taker_fee_bps: float,
     min_oi_usd: float = 0.0,
+    max_abs_entry_basis_bps: float = 100.0,
 ):
     """Rank candidate venue-pairs by E_BE = (basis_cost + fee_cost) / yield_per_epoch.
 
@@ -155,10 +156,11 @@ def breakeven_epochs(
         latest_obs
     FROM pairs
     WHERE 100.0 * (short_apy - long_apy) >= ?
+      AND ABS(10000.0 * (short_mark - long_mark) / ((short_mark + long_mark) / 2.0)) <= ?
     ORDER BY breakeven_epochs ASC NULLS LAST
     LIMIT 200;
     """
-    return sql, [min_volume_usd, min_oi_usd, min_spread_apy_pct]
+    return sql, [min_volume_usd, min_oi_usd, min_spread_apy_pct, max_abs_entry_basis_bps]
 
 
 def historical_funding(symbol: str, exchanges: list[str], hours_back: int | None = None):

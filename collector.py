@@ -66,8 +66,111 @@ def _is_target_market(m: dict) -> bool:
     return m.get("settle") == "USDT" or m.get("quote") == "USDT"
 
 
-async def _fetch_funding(client, target_symbols: list[str]) -> dict[str, dict]:
-    """Batch where supported; per-symbol async fan-out otherwise."""
+async def _native_phemex_funding(client) -> dict[str, dict]:
+    """Funding-only native fetch for phemex.
+
+    One GET to /md/v3/ticker/24hr/all gives us funding rate + predicted rate
+    for every USDT-linear perp. We hand the result back in ccxt-funding-rate
+    shape so normalize() consumes it identically. Mark/OI/volume continue to
+    come from fetch_tickers (which handles phemex's scaled-integer encoding).
+    """
+    raw = await _http_get_json("https://api.phemex.com/md/v3/ticker/24hr/all")
+    result = raw.get("result") or (raw.get("data") or {}).get("result") or []
+    if not isinstance(result, list):
+        raise RuntimeError(f"phemex unexpected response: keys={list(raw.keys())}")
+
+    out: dict[str, dict] = {}
+    for s in result:
+        ccxt_symbol = _ccxt_symbol_for(client, s.get("symbol"))
+        if not ccxt_symbol:
+            continue
+        market = client.markets.get(ccxt_symbol) or {}
+        if not (market.get("linear") and (market.get("settle") == "USDT" or market.get("quote") == "USDT")):
+            continue
+        rate = _f(s.get("fundingRateRr"))
+        if rate is None:
+            rate = _f(s.get("fundingRate"))
+        if rate is None:
+            continue
+        out[ccxt_symbol] = {
+            "symbol":               ccxt_symbol,
+            "fundingRate":          rate,
+            "nextFundingRate":      _f(s.get("predFundingRateRr")) or _f(s.get("predFundingRate")),
+            "fundingTimestamp":     None,
+            "nextFundingTimestamp": None,
+            "interval":             "8h",
+            "info":                 s,
+        }
+    return out
+
+
+async def _native_mexc_funding(client) -> dict[str, dict]:
+    """Funding-only native fetch for mexc.
+
+    One GET to /api/v1/contract/funding_rate returns funding rate, collect cycle
+    (interval), and next settle time for every contract. Tickers/OI keep coming
+    from fetch_tickers + the existing info extractor.
+    """
+    raw = await _http_get_json("https://contract.mexc.com/api/v1/contract/funding_rate")
+    if raw.get("success") is False or (raw.get("code") not in (0, None)):
+        raise RuntimeError(f"mexc non-zero code: {raw.get('code')}")
+    data = raw.get("data")
+    if not isinstance(data, list):
+        raise RuntimeError(f"mexc unexpected data shape: {type(data).__name__}")
+
+    out: dict[str, dict] = {}
+    for s in data:
+        ccxt_symbol = _ccxt_symbol_for(client, s.get("symbol"))
+        if not ccxt_symbol:
+            continue
+        rate = _f(s.get("fundingRate"))
+        if rate is None:
+            continue
+        cycle_h = s.get("collectCycle")
+        try:
+            cycle_h = int(cycle_h) if cycle_h is not None else 8
+        except (TypeError, ValueError):
+            cycle_h = 8
+        next_ts = s.get("nextSettleTime")
+        try:
+            next_ts = int(next_ts) if next_ts is not None else None
+        except (TypeError, ValueError):
+            next_ts = None
+        out[ccxt_symbol] = {
+            "symbol":               ccxt_symbol,
+            "fundingRate":          rate,
+            "fundingTimestamp":     None,
+            "nextFundingTimestamp": next_ts,
+            "interval":             f"{cycle_h}h",
+            "info":                 s,
+        }
+    return out
+
+
+# Funding-only native fetchers: replace slow per-symbol fan-out with a single
+# batch call, but keep tickers/OI flowing through the standard ccxt path.
+# Use this pattern when the venue's all-tickers endpoint is structurally
+# painful to parse (phemex scaled values) but a clean funding-only endpoint
+# exists.
+NATIVE_FUNDING_FETCHERS = {
+    "phemex": _native_phemex_funding,
+    "mexc":   _native_mexc_funding,
+}
+
+
+async def _fetch_funding(client, target_symbols: list[str], canonical: str | None = None) -> dict[str, dict]:
+    """Native funding-only path > ccxt batch > ccxt per-symbol fan-out."""
+    if canonical and canonical in NATIVE_FUNDING_FETCHERS:
+        try:
+            rows = await NATIVE_FUNDING_FETCHERS[canonical](client)
+            min_acceptable = max(50, len(target_symbols) // 2)
+            if len(rows) >= min_acceptable:
+                return rows
+            log.warning("%s native funding returned %d/%d rows; falling back",
+                        canonical, len(rows), len(target_symbols))
+        except Exception as e:
+            log.warning("%s native funding failed (%s); falling back", canonical, e)
+
     if client.has.get("fetchFundingRates"):
         try:
             return await client.fetch_funding_rates()
@@ -170,60 +273,14 @@ async def _native_bitmart(client, cycle_ts: datetime, canonical: str) -> list[di
     return rows
 
 
-async def _native_phemex(client, cycle_ts: datetime, canonical: str) -> list[dict]:
-    """Single GET to /md/v3/ticker/24hr/all — all USDT-linear perp tickers in one shot.
-
-    Phemex's `Rr` suffix = real rate; `Rp` = real price; `Rq` = real quantity (base).
-    OI is in base units, so converted to USD by × mark.
-    """
-    raw = await _http_get_json("https://api.phemex.com/md/v3/ticker/24hr/all")
-    result = raw.get("result")
-    if not isinstance(result, list):
-        # Some response shapes wrap under data.result
-        data = raw.get("data")
-        result = (data or {}).get("result") if isinstance(data, dict) else None
-    if not isinstance(result, list):
-        raise RuntimeError(f"phemex native unexpected response: keys={list(raw.keys())}")
-
-    rows: list[dict] = []
-    for s in result:
-        venue_symbol = s.get("symbol")
-        ccxt_symbol = _ccxt_symbol_for(client, venue_symbol)
-        if not ccxt_symbol:
-            continue
-        market = client.markets.get(ccxt_symbol) or {}
-        # USDT-margined linear only (skip USD-inverse contracts)
-        if not (market.get("linear") and (market.get("settle") == "USDT" or market.get("quote") == "USDT")):
-            continue
-        rate = _f(s.get("fundingRateRr")) if s.get("fundingRateRr") is not None else _f(s.get("fundingRate"))
-        if rate is None:
-            continue
-        interval_h = 8  # Phemex default for USDT linear; refine if observed otherwise
-        mark = _f(s.get("markPriceRp")) or _f(s.get("closeRp")) or _f(s.get("markPrice"))
-        oi_base = _f(s.get("openInterestRv")) or _f(s.get("openInterestRq")) or _f(s.get("openInterest"))
-        oi_usd = (oi_base * mark) if (oi_base is not None and mark is not None) else None
-        rows.append({
-            "ts_utc":             cycle_ts,
-            "exchange":           canonical,
-            "symbol_canonical":   ccxt_symbol,
-            "funding_rate":       rate,
-            "funding_interval_h": interval_h,
-            "predicted_rate":     _f(s.get("predFundingRateRr")) or _f(s.get("predFundingRate")),
-            "next_funding_ts":    None,
-            "mark_price":         mark,
-            "index_price":        _f(s.get("indexPriceRp")),
-            "open_interest_usd":  oi_usd,
-            "volume_24h_usd":     _f(s.get("turnoverRv")),
-            "apy_norm":           rate * (EPOCHS_PER_YEAR / interval_h),
-        })
-    return rows
-
-
-# Per-venue native batch fetchers — each one collapses tickers + funding + OI
-# into a single round-trip, replacing slow CCXT per-symbol fan-out paths.
+# All-in-one native batch fetchers — the venue's response is rich enough that
+# we replace tickers + funding + OI in a single round-trip. Use this only when
+# the response shape is clean to parse end-to-end (bitmart's v2 contract API).
+# For venues where only funding is cleanly batchable but mark/OI need the
+# standard ccxt path (e.g. phemex's scaled-integer encoding), use
+# NATIVE_FUNDING_FETCHERS above instead.
 NATIVE_FETCHERS = {
     "bitmart": _native_bitmart,
-    "phemex":  _native_phemex,
 }
 
 
@@ -258,7 +315,7 @@ async def fetch_venue(canonical: str, cfg: dict, cycle_ts: datetime) -> list[dic
 
         tickers_task = asyncio.create_task(client.fetch_tickers(target_symbols))
         oi_task = asyncio.create_task(_fetch_open_interest(client, target_symbols))
-        funding_task = asyncio.create_task(_fetch_funding(client, target_symbols))
+        funding_task = asyncio.create_task(_fetch_funding(client, target_symbols, canonical))
 
         tickers, oi_map, funding_rates = await asyncio.gather(
             tickers_task, oi_task, funding_task, return_exceptions=False

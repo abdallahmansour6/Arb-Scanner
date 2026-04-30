@@ -118,7 +118,10 @@ with tab_delta:
         min_vol_delta = st.number_input(
             "Minimum 24h volume on each leg (USD)",
             min_value=0, value=DEFAULT_MIN_VOLUME_24H_USD, step=100_000, format="%d",
-            help="Excludes pairs where either leg lacks the notional liquidity to be a viable arb leg.",
+            help=(
+                "**Strict** — pairs where volume is NULL are excluded. "
+                "(Volume NULL means the venue's ticker didn't report it; we won't trade what we can't verify.)"
+            ),
             key="delta_min_vol",
         )
     with c2:
@@ -126,8 +129,8 @@ with tab_delta:
             "Minimum Open Interest (USD)",
             min_value=0, value=0, step=100_000, format="%d",
             help=(
-                "NULL-tolerant: rows where OI isn't reported (4/14 venues) pass through. "
-                "Only non-NULL OI values are checked against the threshold."
+                "**NULL-tolerant** — pairs from the 4 venues that don't expose OI (binance, bingx, "
+                "blofin, xt) still pass; only non-NULL OI values are checked against the threshold."
             ),
             key="delta_min_oi",
         )
@@ -164,14 +167,17 @@ with tab_anom:
         min_vol_anom = st.number_input(
             "Minimum 24h volume (USD)",
             min_value=0, value=DEFAULT_MIN_VOLUME_24H_USD, step=100_000, format="%d",
-            help="Excludes pairs that don't trade enough notional to be a viable arb leg.",
+            help="**Strict** — pairs with NULL volume are excluded.",
             key="anom_min_vol",
         )
     with c2:
         min_oi_anom = st.number_input(
             "Minimum Open Interest (USD)",
             min_value=0, value=0, step=100_000, format="%d",
-            help="NULL-tolerant — pairs without OI data still pass.",
+            help=(
+                "**NULL-tolerant** — pairs from venues that don't report OI "
+                "(binance, bingx, blofin, xt) still pass."
+            ),
             key="anom_min_oi",
         )
     with c3:
@@ -219,38 +225,48 @@ with tab_be:
         "For each candidate venue-pair, **Breakeven Epochs** = how many funding cycles "
         "you'd need to hold the position before the captured yield covers your round-trip cost."
     )
-    with st.expander("How this is calculated", expanded=False):
+    with st.expander("How this is calculated (and how to read the columns)", expanded=False):
         st.markdown(
             "**Entry basis** is computed live from the mark-price spread between the two venues: "
             "`entry_basis_bps = 10000 × (mark_short − mark_long) / mid_mark`. "
-            "Positive = favorable entry (you sell the high-priced venue and buy the low-priced one). "
-            "Negative = you pay the spread on entry.\n\n"
-            "**Exit basis** defaults to 0 — the standard delta-neutral assumption is that "
-            "the inter-venue price gap converges by unwind. Use the slider below to stress-test "
-            "what happens if convergence is incomplete.\n\n"
-            "**Round-trip cost** = `(exit_basis − entry_basis) + 4 × taker_fee_bps`. "
-            "(4 = entry + exit, both legs.) **Yield per epoch** = `spread_APY_% × interval_h / 8760`. "
-            "**E_BE** = round-trip cost / yield per epoch. **Negative E_BE** means the entry is "
-            "favorable enough that you profit instantly — no holding required."
+            "Positive = favorable entry (sell high, buy low). Negative = you pay the spread on entry.\n\n"
+            "**Sanity check on entry basis:** healthy cross-venue mark spreads on liquid pairs sit within "
+            "~1–20 bps. Anything above ~100 bps usually indicates stale data on one venue or an illiquid "
+            "pair whose price discovery hasn't converged — *not* a real arb, since you can't trade size at "
+            "those quotes. The **Max |entry basis|** filter below excludes those (default 100 bps).\n\n"
+            "**Exit basis** defaults to 0 — the standard delta-neutral assumption is price convergence at "
+            "unwind. Use the slider to stress-test imperfect convergence.\n\n"
+            "**Round-trip cost** = `(exit_basis − entry_basis) + 4 × taker_fee_bps` (4 = entry + exit, "
+            "both legs). **Yield per epoch** = `spread_APY_% × interval_h / 8760`. "
+            "**Breakeven epochs** = round-trip cost ÷ yield per epoch:\n"
+            "- **Positive** = funding cycles to hold before profit covers cost (lower = better).\n"
+            "- **Zero** = breakeven at entry.\n"
+            "- **Negative** = profitable at entry, before any funding accrues. Magnitude isn't economically "
+            "meaningful — sort by spread APY or entry basis to pick between negatives.\n\n"
+            "**NULL handling:** Volume filter is *strict* (NULL volume rows excluded — won't trade what we "
+            "can't verify). OI filter is *NULL-tolerant* (pairs from binance/bingx/blofin/xt — which don't "
+            "expose OI — still pass). Sorting on a column with NULLs places NULLs last."
         )
     st.caption(
         f":{'green' if age_min <= 15 else 'orange' if age_min <= 30 else 'red'}"
-        f"[●] Mark prices used for entry-basis are from the **{age_min:.1f}-min-old** cycle. "
-        "Stale mark = stale basis. Watch this if cycle drifts."
+        f"[●] Mark prices below are from the **{age_min:.1f}-min-old** cycle. "
+        "The engine reads live order book at execution time — these are *ranking* values, not the "
+        "basis you'll actually fill at."
     )
 
-    c1, c2, c3, c4, c5 = st.columns(5)
+    c1, c2, c3 = st.columns(3)
     with c1:
         min_vol_be = st.number_input(
             "Minimum 24h volume on each leg (USD)",
             min_value=0, value=DEFAULT_MIN_VOLUME_24H_USD, step=100_000, format="%d",
+            help="Strict — pairs with NULL volume are excluded.",
             key="be_min_vol",
         )
     with c2:
         min_oi_be = st.number_input(
             "Minimum Open Interest (USD)",
             min_value=0, value=0, step=100_000, format="%d",
-            help="NULL-tolerant — pairs without OI data still pass.",
+            help="NULL-tolerant — pairs from venues that don't report OI still pass.",
             key="be_min_oi",
         )
     with c3:
@@ -260,14 +276,26 @@ with tab_be:
             help="Cross-venue annualized APY gap required to even consider the pair.",
             key="be_min_spread",
         )
+    c4, c5, c6 = st.columns(3)
     with c4:
+        max_abs_entry_basis_bps = st.number_input(
+            "Max |entry basis| (bps)",
+            min_value=0.0, value=100.0, step=10.0,
+            help=(
+                "Excludes pairs where the cross-venue mark spread exceeds this threshold. "
+                "Spreads above ~100 bps almost always indicate stale prices or illiquid discovery, "
+                "not real arb. Lower (e.g. 20 bps) if you only want tightly-tradeable basis."
+            ),
+            key="be_max_abs_entry_basis",
+        )
+    with c5:
         taker_fee_bps = st.number_input(
             "Taker fee per side (bps)",
             value=DEFAULT_TAKER_FEE_BPS, step=0.5, min_value=0.0,
             help="Used 4× in the cost (entry + exit, both legs).",
             key="be_taker_fee",
         )
-    with c5:
+    with c6:
         exit_basis_bps = st.number_input(
             "Residual exit basis (bps)",
             value=DEFAULT_EXIT_BASIS_BPS, step=1.0,
@@ -278,7 +306,9 @@ with tab_be:
             key="be_exit_basis",
         )
 
-    sql, params = analytics.breakeven_epochs(min_spread_apy, min_vol_be, exit_basis_bps, taker_fee_bps, min_oi_be)
+    sql, params = analytics.breakeven_epochs(
+        min_spread_apy, min_vol_be, exit_basis_bps, taker_fee_bps, min_oi_be, max_abs_entry_basis_bps,
+    )
     df = cached_query(sql, tuple(params))
     if df.empty:
         st.info("No venue-pair candidates meet the spread threshold.")
@@ -295,10 +325,22 @@ with tab_be:
                 "interval_mismatch":   st.column_config.CheckboxColumn("Interval mismatch"),
                 "long_mark":           st.column_config.NumberColumn("Long mark", format="%.6f"),
                 "short_mark":          st.column_config.NumberColumn("Short mark", format="%.6f"),
-                "entry_basis_bps":     COL_BPS_SIGNED("Entry basis (live)"),
+                "entry_basis_bps":     st.column_config.NumberColumn(
+                    "Entry basis (bps)", format="%+.1f",
+                    help=(
+                        "Cross-venue mark spread, in basis points (1 bp = 0.01%). "
+                        "Positive = favorable (sell high, buy low). Negative = you pay the spread. "
+                        "Healthy liquid pairs sit at 1–20 bps; larger values are filtered out by Max |entry basis|."
+                    ),
+                ),
                 "breakeven_epochs":    st.column_config.NumberColumn(
-                    "Breakeven epochs", format="%.2f",
-                    help="Negative values mean entry is favorable enough that you profit instantly.",
+                    "Breakeven (epochs)", format="%.2f",
+                    help=(
+                        "Funding cycles to hold for round-trip profit. "
+                        "Positive = must hold N cycles. Zero = breakeven at entry. "
+                        "Negative = profitable at entry before any funding accrues — magnitude isn't "
+                        "economically meaningful, just the sign."
+                    ),
                 ),
                 "min_volume_24h_usd":  COL_USD("Min 24h Volume"),
                 "latest_obs":          COL_DT("Mark as of"),
@@ -308,11 +350,16 @@ with tab_be:
 # ============== Symbol Chart ==============
 with tab_chart:
     st.markdown(
-        "Per-symbol, per-venue history. The **top chart** shows Annualized APY — comparable "
-        "across all venues regardless of their funding interval. The **bottom chart** shows the "
-        "raw per-epoch funding rate, where each point is the rate paid in that specific funding "
-        "cycle (so a 1h-interval venue's points represent 1h yields and an 8h-interval venue's "
-        "points represent 8h yields — values are *not* comparable across intervals)."
+        "Per-symbol, per-venue history.\n\n"
+        "**Top chart — Annualized APY (%)**: directly comparable across all venues. The y-axis is the "
+        "annualized funding yield, normalized so a 1h-interval pair and an 8h-interval pair sit on the "
+        "same scale.\n\n"
+        "**Bottom chart — raw per-epoch funding rate**: shows the rate paid *in each individual funding "
+        "cycle*, exactly as the venue reports it. Magnitudes here are **not directly comparable between "
+        "lines** because each venue's funding cycle has a different duration: a 0.01%-per-epoch line on "
+        "a 1h-interval venue delivers 8× the annualized yield of a 0.01%-per-epoch line on an 8h-interval "
+        "venue. Use this chart to inspect raw cadence and per-cycle volatility; use the top chart for "
+        "comparison."
     )
     symbols = list_distinct("symbol_canonical")
     if not symbols:
