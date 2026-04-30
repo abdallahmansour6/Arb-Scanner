@@ -9,12 +9,28 @@ import logging
 import time
 from datetime import datetime, timezone
 
+import aiohttp
 import ccxt.async_support as ccxt_async
 
 from config import EPOCHS_PER_YEAR, VENUES
 from normalize import normalize
 
 log = logging.getLogger(__name__)
+
+_HTTP_TIMEOUT = aiohttp.ClientTimeout(total=20)
+_HTTP_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; ArbScanner/0.1)"}
+
+
+async def _http_get_json(url: str) -> dict:
+    """Single-shot GET with a fresh session; returns parsed JSON.
+
+    Bypasses ccxt's `fetch()` to avoid the 4.5.49 header-handling edge case
+    that surfaced as `'NoneType' object has no attribute 'lower'` on bitmart.
+    """
+    async with aiohttp.ClientSession(timeout=_HTTP_TIMEOUT, headers=_HTTP_HEADERS) as session:
+        async with session.get(url) as resp:
+            resp.raise_for_status()
+            return await resp.json()
 
 
 def _f(x):
@@ -90,24 +106,30 @@ async def _fetch_open_interest(client, target_symbols: list[str]) -> dict[str, f
     return out
 
 
+def _ccxt_symbol_for(client, venue_symbol: str | None) -> str | None:
+    """Map a venue-native symbol id to ccxt's unified symbol."""
+    if not venue_symbol:
+        return None
+    markets = client.markets_by_id.get(venue_symbol) or []
+    return markets[0].get("symbol") if markets else None
+
+
 async def _native_bitmart(client, cycle_ts: datetime, canonical: str) -> list[dict]:
     """Single GET to /contract/public/details — replaces tickers + per-symbol funding + OI.
 
-    Bitmart's batch contract endpoint returns funding_rate, expected_funding_rate,
-    open_interest_value (USD), turnover_24h (USD), last_price, funding_interval_hours,
-    next_funding_rate_timestamp — everything we need in one round-trip.
+    Returns funding_rate, expected_funding_rate, open_interest_value (USD),
+    turnover_24h (USD), last_price, funding_interval_hours, and
+    next_funding_rate_timestamp in one round-trip.
     """
-    raw = await client.fetch("https://api-cloud.bitmart.com/contract/public/details", "GET")
+    raw = await _http_get_json("https://api-cloud.bitmart.com/contract/public/details")
     rows: list[dict] = []
     payload = (raw or {}).get("data") or {}
-    for s in payload.get("symbols", []) or []:
+    for s in payload.get("symbols") or []:
         if s.get("product_type") != 1:                # 1 = perpetual
             continue
         if s.get("quote_currency") != "USDT":
             continue
-        venue_symbol = s.get("symbol")
-        markets_for_id = client.markets_by_id.get(venue_symbol) or []
-        ccxt_symbol = (markets_for_id[0].get("symbol") if markets_for_id else None)
+        ccxt_symbol = _ccxt_symbol_for(client, s.get("symbol"))
         if not ccxt_symbol:
             continue
         rate = _f(s.get("funding_rate"))
@@ -131,10 +153,60 @@ async def _native_bitmart(client, cycle_ts: datetime, canonical: str) -> list[di
     return rows
 
 
+async def _native_phemex(client, cycle_ts: datetime, canonical: str) -> list[dict]:
+    """Single GET to /md/v3/ticker/24hr/all — all USDT-linear perp tickers in one shot.
+
+    Phemex's `Rr` suffix = real rate; `Rp` = real price; `Rq` = real quantity (base).
+    OI is in base units, so converted to USD by × mark.
+    """
+    raw = await _http_get_json("https://api.phemex.com/md/v3/ticker/24hr/all")
+    result = raw.get("result")
+    if not isinstance(result, list):
+        # Some response shapes wrap under data.result
+        data = raw.get("data")
+        result = (data or {}).get("result") if isinstance(data, dict) else None
+    if not isinstance(result, list):
+        raise RuntimeError(f"phemex native unexpected response: keys={list(raw.keys())}")
+
+    rows: list[dict] = []
+    for s in result:
+        venue_symbol = s.get("symbol")
+        ccxt_symbol = _ccxt_symbol_for(client, venue_symbol)
+        if not ccxt_symbol:
+            continue
+        market = client.markets.get(ccxt_symbol) or {}
+        # USDT-margined linear only (skip USD-inverse contracts)
+        if not (market.get("linear") and (market.get("settle") == "USDT" or market.get("quote") == "USDT")):
+            continue
+        rate = _f(s.get("fundingRateRr")) if s.get("fundingRateRr") is not None else _f(s.get("fundingRate"))
+        if rate is None:
+            continue
+        interval_h = 8  # Phemex default for USDT linear; refine if observed otherwise
+        mark = _f(s.get("markPriceRp")) or _f(s.get("closeRp")) or _f(s.get("markPrice"))
+        oi_base = _f(s.get("openInterestRv")) or _f(s.get("openInterestRq")) or _f(s.get("openInterest"))
+        oi_usd = (oi_base * mark) if (oi_base is not None and mark is not None) else None
+        rows.append({
+            "ts_utc":             cycle_ts,
+            "exchange":           canonical,
+            "symbol_canonical":   ccxt_symbol,
+            "funding_rate":       rate,
+            "funding_interval_h": interval_h,
+            "predicted_rate":     _f(s.get("predFundingRateRr")) or _f(s.get("predFundingRate")),
+            "next_funding_ts":    None,
+            "mark_price":         mark,
+            "index_price":        _f(s.get("indexPriceRp")),
+            "open_interest_usd":  oi_usd,
+            "volume_24h_usd":     _f(s.get("turnoverRv")),
+            "apy_norm":           rate * (EPOCHS_PER_YEAR / interval_h),
+        })
+    return rows
+
+
 # Per-venue native batch fetchers — each one collapses tickers + funding + OI
 # into a single round-trip, replacing slow CCXT per-symbol fan-out paths.
 NATIVE_FETCHERS = {
     "bitmart": _native_bitmart,
+    "phemex":  _native_phemex,
 }
 
 
@@ -145,18 +217,24 @@ async def fetch_venue(canonical: str, cfg: dict, cycle_ts: datetime) -> list[dic
     try:
         await client.load_markets()
 
-        # Try the native batch path first; fall back to the standard CCXT path on failure.
+        target_symbols = [s for s, m in client.markets.items() if _is_target_market(m)]
+
+        # Try the native batch path first; fall back to the standard CCXT path on
+        # failure OR if the response yielded suspiciously few rows (wrong field names).
         native = NATIVE_FETCHERS.get(canonical)
         if native is not None:
             try:
                 rows = await native(client, cycle_ts, canonical)
-                log.info("venue %s (native): %d obs in %.1fs",
-                         canonical, len(rows), time.monotonic() - t0)
-                return rows
+                min_acceptable = max(50, len(target_symbols) // 2)
+                if len(rows) >= min_acceptable:
+                    log.info("venue %s (native): %d obs in %.1fs",
+                             canonical, len(rows), time.monotonic() - t0)
+                    return rows
+                log.warning("%s native returned only %d/%d rows; falling back to CCXT path",
+                            canonical, len(rows), len(target_symbols))
             except Exception as e:
                 log.warning("%s native batch failed (%s); falling back to CCXT path", canonical, e)
 
-        target_symbols = [s for s, m in client.markets.items() if _is_target_market(m)]
         if not target_symbols:
             log.warning("%s: no USDT linear-swap markets discovered", canonical)
             return []

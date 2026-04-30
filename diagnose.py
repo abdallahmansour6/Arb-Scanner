@@ -76,7 +76,7 @@ def main() -> None:
         status = "OK  " if n > 0 else "FAIL"
         print(f"  {status}  {venue:10s}  {n:>4d} symbols")
 
-    _h("Schema integrity")
+    _h("Schema integrity (full dataset)")
     integ = query("""
         SELECT COUNT(*) AS total,
                SUM(CASE WHEN funding_rate IS NULL THEN 1 ELSE 0 END)        AS null_rate,
@@ -95,6 +95,22 @@ def main() -> None:
     print(f"NULL volume_24h:   {_pct(int(integ['null_vol']), total)}")
     print(f"NULL open_int:     {_pct(int(integ['null_oi']), total)}")
     print(f"NULL mark_price:   {_pct(int(integ['null_mark']), total)}")
+
+    _h("Per-venue NULL rates (latest cycle only — current code performance)")
+    by_venue = query("""
+        WITH last AS (SELECT MAX(ts_utc) AS m FROM funding)
+        SELECT exchange,
+               COUNT(*) AS rows,
+               100.0 * SUM(CASE WHEN volume_24h_usd IS NULL THEN 1 ELSE 0 END) / COUNT(*)    AS vol_null_pct,
+               100.0 * SUM(CASE WHEN open_interest_usd IS NULL THEN 1 ELSE 0 END) / COUNT(*) AS oi_null_pct,
+               100.0 * SUM(CASE WHEN mark_price IS NULL THEN 1 ELSE 0 END) / COUNT(*)        AS mark_null_pct
+        FROM funding, last
+        WHERE ts_utc = last.m
+        GROUP BY exchange
+        ORDER BY exchange
+    """)
+    if not by_venue.empty:
+        print(by_venue.to_string(index=False, float_format=lambda x: f"{x:6.1f}"))
 
     _h("Funding by interval")
     dist = query("""
