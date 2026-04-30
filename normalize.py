@@ -4,9 +4,15 @@ Every observation downstream of this module conforms to the locked row shape
 defined by CANONICAL_FIELDS. Exchange-specific idiosyncrasies do not leak.
 """
 
+import re
 from datetime import datetime, timezone
 
 from config import EPOCHS_PER_YEAR
+
+# All target venues currently default to 8h funding cycles for vanilla USDT
+# linear perps. A handful of pairs run on 4h or 1h schedules; those are picked
+# up explicitly when the response carries timestamps or an `interval` field.
+DEFAULT_INTERVAL_H = 8
 
 CANONICAL_FIELDS = [
     "ts_utc",                # cycle timestamp (datetime, UTC)
@@ -24,17 +30,43 @@ CANONICAL_FIELDS = [
 ]
 
 
+_INTERVAL_PAT = re.compile(r"(\d+)\s*h", re.IGNORECASE)
+
+
+def _snap(delta_h: float) -> int | None:
+    for known in (1, 4, 8):
+        if abs(delta_h - known) < 0.5:
+            return known
+    return None
+
+
 def detect_interval_h(fr: dict) -> int | None:
-    """Snap the timestamp delta to the nearest known interval {1, 4, 8}."""
-    fts, nfts = fr.get("fundingTimestamp"), fr.get("nextFundingTimestamp")
-    if not fts or not nfts or nfts <= fts:
-        return None
-    delta_h = (nfts - fts) / 3_600_000
-    if delta_h <= 2:
-        return 1 if delta_h <= 2.5 else 4
-    if delta_h <= 6:
-        return 4
-    return 8
+    """Resolve the funding interval in hours, in order of decreasing reliability.
+
+    1) Explicit `interval` string from CCXT (e.g. "8h", "4h").
+    2) Diff of any two of (previous, current, next) funding timestamps.
+    3) `DEFAULT_INTERVAL_H` — most target venues run 8h.
+    """
+    interval_str = fr.get("interval")
+    if isinstance(interval_str, str):
+        m = _INTERVAL_PAT.search(interval_str)
+        if m:
+            snapped = _snap(int(m.group(1)))
+            if snapped is not None:
+                return snapped
+
+    fts = fr.get("fundingTimestamp")
+    nfts = fr.get("nextFundingTimestamp")
+    pfts = fr.get("previousFundingTimestamp")
+
+    if fts and nfts and nfts > fts:
+        return _snap((nfts - fts) / 3_600_000) or DEFAULT_INTERVAL_H
+    if fts and pfts and fts > pfts:
+        return _snap((fts - pfts) / 3_600_000) or DEFAULT_INTERVAL_H
+    if pfts and nfts and nfts > pfts:
+        return _snap((nfts - pfts) / 3_600_000 / 2) or DEFAULT_INTERVAL_H
+
+    return DEFAULT_INTERVAL_H
 
 
 def compute_apy_norm(rate: float | None, interval_h: int | None) -> float | None:

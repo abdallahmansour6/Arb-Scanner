@@ -6,6 +6,7 @@ at the boundary, isolated failure domain per venue.
 
 import asyncio
 import logging
+import time
 from datetime import datetime, timezone
 
 import ccxt.async_support as ccxt_async
@@ -17,8 +18,15 @@ log = logging.getLogger(__name__)
 
 
 def _is_target_market(m: dict) -> bool:
-    """USDT-margined linear perpetual swaps only."""
-    return bool(m.get("swap")) and bool(m.get("linear")) and m.get("quote") == "USDT" and m.get("active", True)
+    """USDT-margined linear perpetual swaps.
+
+    Accepts either `quote == 'USDT'` (BTC/USDT:USDT) or `settle == 'USDT'`
+    (BTC/USD:USDT, used by venues like coinex for USD-quoted, USDT-settled
+    contracts — still a USDT-margined linear perp).
+    """
+    if not (m.get("swap") and m.get("linear") and m.get("active", True)):
+        return False
+    return m.get("settle") == "USDT" or m.get("quote") == "USDT"
 
 
 async def _fetch_funding(client, target_symbols: list[str]) -> dict[str, dict]:
@@ -64,6 +72,7 @@ async def _fetch_open_interest(client, target_symbols: list[str]) -> dict[str, f
 async def fetch_venue(canonical: str, cfg: dict, cycle_ts: datetime) -> list[dict]:
     cls = getattr(ccxt_async, cfg["ccxt_id"])
     client = cls({"options": cfg.get("options", {}), "enableRateLimit": True})
+    t0 = time.monotonic()
     try:
         await client.load_markets()
         target_symbols = [s for s, m in client.markets.items() if _is_target_market(m)]
@@ -84,6 +93,8 @@ async def fetch_venue(canonical: str, cfg: dict, cycle_ts: datetime) -> list[dic
             row = normalize(canonical, cycle_ts, fr, tickers.get(symbol), oi_map.get(symbol))
             if row is not None:
                 rows.append(row)
+        log.info("venue %s: %d obs in %.1fs (%d markets)",
+                 canonical, len(rows), time.monotonic() - t0, len(target_symbols))
         return rows
     finally:
         await client.close()
@@ -98,6 +109,5 @@ async def collect_once() -> list[dict]:
         if isinstance(result, Exception):
             log.warning("venue %s: collection failed: %s", name, result)
             continue
-        log.info("venue %s: %d observations", name, len(result))
         all_rows.extend(result)
     return all_rows

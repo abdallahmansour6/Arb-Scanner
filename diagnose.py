@@ -24,6 +24,19 @@ def _pct(n: int, total: int) -> str:
     return f"{n}/{total} ({(100 * n / total):.1f}%)" if total else f"{n}/0"
 
 
+def _f(x, fmt: str = "+8.1f", na: str = "    n/a") -> str:
+    if x is None:
+        return na
+    try:
+        return format(float(x), fmt)
+    except (TypeError, ValueError):
+        return na
+
+
+def _s(x, width: int = 9, na: str = "n/a") -> str:
+    return f"{(x if x is not None else na):<{width}s}"
+
+
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--log", type=Path, help="Optional collector log file to tail.")
@@ -105,9 +118,9 @@ def main() -> None:
         for _, r in df.iterrows():
             print(
                 f"  {r['symbol_canonical']:24s} "
-                f"delta={float(r['delta_apy_pct']):+9.1f}%  "
-                f"short={r['short_venue']:9s} ({float(r['short_apy_pct']):+8.1f}%)  "
-                f"long={r['long_venue']:9s} ({float(r['long_apy_pct']):+8.1f}%)"
+                f"delta={_f(r['delta_apy_pct'], '+9.1f')}%  "
+                f"short={_s(r['short_venue'])} ({_f(r['short_apy_pct'])}%)  "
+                f"long={_s(r['long_venue'])} ({_f(r['long_apy_pct'])}%)"
             )
 
     _h("Top 5 anomalies (|APY|>=100%, persistence>=2)")
@@ -119,11 +132,13 @@ def main() -> None:
         print("(none)")
     else:
         for _, r in df.iterrows():
+            persist = r["persistence_count"]
+            persist_s = str(int(persist)) if persist is not None else "n/a"
             print(
                 f"  {r['symbol_canonical']:24s} {r['exchange']:10s}  "
-                f"avg={float(r['avg_apy_pct']):+8.1f}%  "
-                f"max_abs={float(r['max_abs_apy_pct']):8.1f}%  "
-                f"persist={int(r['persistence_count'])}"
+                f"avg={_f(r['avg_apy_pct'])}%  "
+                f"max_abs={_f(r['max_abs_apy_pct'], '8.1f')}%  "
+                f"persist={persist_s}"
             )
 
     if args.log and args.log.exists():

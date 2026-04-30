@@ -18,6 +18,7 @@ def cross_exchange_delta(min_volume_usd: float):
                ROW_NUMBER() OVER (PARTITION BY symbol_canonical, exchange ORDER BY ts_utc DESC) AS rn
         FROM funding
         WHERE volume_24h_usd >= ?
+          AND apy_norm IS NOT NULL
     )
     SELECT
         symbol_canonical,
@@ -48,6 +49,7 @@ def anomaly_candidates(min_abs_apy_pct: float, min_volume_usd: float, min_persis
                ROW_NUMBER() OVER (PARTITION BY symbol_canonical, exchange ORDER BY ts_utc DESC) AS rn
         FROM funding
         WHERE volume_24h_usd >= ?
+          AND apy_norm IS NOT NULL
     )
     SELECT
         symbol_canonical, exchange,
@@ -88,6 +90,7 @@ def breakeven_epochs(
                ROW_NUMBER() OVER (PARTITION BY symbol_canonical, exchange ORDER BY ts_utc DESC) AS rn
         FROM funding
         WHERE volume_24h_usd >= ?
+          AND apy_norm IS NOT NULL
     ),
     snap AS (SELECT * FROM latest WHERE rn = 1)
     SELECT
