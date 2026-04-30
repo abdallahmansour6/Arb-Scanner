@@ -432,16 +432,15 @@ with tab_be:
 # ============== Symbol Chart ==============
 with tab_chart:
     st.markdown(
-        "Per-symbol, per-venue history.\n\n"
-        "**Top chart — Annualized APY (%)**: directly comparable across all venues. The y-axis is the "
+        "Per-symbol, per-venue history. Two views over the same data:\n\n"
+        "**Annualized APY**: directly comparable across all venues. The y-axis is the "
         "annualized funding yield, normalized so a 1h-interval pair and an 8h-interval pair sit on the "
         "same scale.\n\n"
-        "**Bottom chart — raw per-epoch funding rate**: shows the rate paid *in each individual funding "
-        "cycle*, exactly as the venue reports it. Magnitudes here are **not directly comparable between "
-        "lines** because each venue's funding cycle has a different duration: a 0.01%-per-epoch line on "
-        "a 1h-interval venue delivers 8× the annualized yield of a 0.01%-per-epoch line on an 8h-interval "
-        "venue. Use this chart to inspect raw cadence and per-cycle volatility; use the top chart for "
-        "comparison."
+        "**Raw per-epoch rate**: shows the rate paid *in each individual funding cycle*, exactly as the "
+        "venue reports it. Magnitudes are **not directly comparable between lines** because each venue's "
+        "funding cycle has a different duration — a 0.01%-per-epoch line on a 1h-interval venue delivers "
+        "8× the annualized yield of a 0.01%-per-epoch line on an 8h-interval venue. Use this view to "
+        "inspect raw cadence and per-cycle volatility; use Annualized APY for comparison."
     )
     symbols = list_distinct("symbol_canonical")
     if not symbols:
@@ -456,67 +455,80 @@ with tab_chart:
             period_label = st.radio(
                 "Time window", list(period_options.keys()),
                 index=2, horizontal=True,
-                help="Restricts the chart to the trailing window. Drag-zoom in plotly for finer slices.",
+                help="Restricts both views to the trailing window. Drag-zoom in plotly for finer slices.",
                 key="chart_period",
             )
             hours_back = period_options[period_label]
 
-        venues_top = st.multiselect(
-            "Venues for top chart (Annualized APY)",
-            list(VENUES.keys()),
-            default=list(VENUES.keys()),
-            key="chart_venues_top",
-        )
-        venues_bottom = st.multiselect(
-            "Venues for bottom chart (Raw per-epoch rate)",
-            list(VENUES.keys()),
-            default=list(VENUES.keys()),
-            key="chart_venues_bottom",
-        )
+        venues_apy = st.session_state.get("chart_venues_apy", list(VENUES.keys()))
+        venues_rate = st.session_state.get("chart_venues_rate", list(VENUES.keys()))
+        union_venues = sorted(set(venues_apy) | set(venues_rate))
 
-        union_venues = sorted(set(venues_top) | set(venues_bottom))
-        if symbol and union_venues:
+        if not symbol or not union_venues:
+            df = pd.DataFrame()
+        else:
             sql, params = analytics.historical_funding(symbol, union_venues, hours_back)
             df = cached_query(sql, tuple(params))
-            if df.empty:
-                st.info("No observations for this symbol/venue/window combination.")
-            else:
-                df["apy_pct"] = df["apy_norm"] * 100
-                # Annotate venue with its funding interval (mode within the window).
-                interval_per_venue = (
-                    df.dropna(subset=["funding_interval_h"])
-                      .groupby("exchange")["funding_interval_h"]
-                      .agg(lambda s: int(s.mode().iloc[0]) if len(s.mode()) else None)
-                      .to_dict()
-                )
-                df["venue_label"] = df["exchange"].map(
-                    lambda e: f"{e} ({interval_per_venue.get(e)}h)" if interval_per_venue.get(e) else e
-                )
 
-                df_top = df[df["exchange"].isin(venues_top)] if venues_top else df.iloc[0:0]
-                df_bot = df[df["exchange"].isin(venues_bottom)] if venues_bottom else df.iloc[0:0]
+        if df.empty:
+            df_apy = df_rate = df
+        else:
+            df = df.copy()
+            df["apy_pct"] = df["apy_norm"] * 100
+            # Annotate venue with its funding interval (mode within the window).
+            interval_per_venue = (
+                df.dropna(subset=["funding_interval_h"])
+                  .groupby("exchange")["funding_interval_h"]
+                  .agg(lambda s: int(s.mode().iloc[0]) if len(s.mode()) else None)
+                  .to_dict()
+            )
+            df["venue_label"] = df["exchange"].map(
+                lambda e: f"{e} ({interval_per_venue.get(e)}h)" if interval_per_venue.get(e) else e
+            )
+            df_apy = df[df["exchange"].isin(venues_apy)] if venues_apy else df.iloc[0:0]
+            df_rate = df[df["exchange"].isin(venues_rate)] if venues_rate else df.iloc[0:0]
 
-                if df_top.empty:
-                    st.info("Top chart: no venues selected (or no data).")
-                else:
-                    fig = px.line(
-                        df_top, x="ts_utc", y="apy_pct", color="venue_label",
-                        title=f"{symbol} — Annualized APY (%) — comparable across all venues",
-                        labels={"ts_utc": "Time (UTC)", "apy_pct": "Annualized APY (%)", "venue_label": "Venue"},
-                    )
-                    fig.update_layout(
-                        hovermode="x unified",
-                        xaxis=dict(rangeslider=dict(visible=True), type="date"),
-                    )
-                    st.plotly_chart(fig, width="stretch")
+        # ---- Annualized APY ----
+        st.subheader("Annualized APY")
+        st.multiselect(
+            "Venues",
+            list(VENUES.keys()),
+            default=list(VENUES.keys()),
+            key="chart_venues_apy",
+        )
+        if df.empty:
+            st.info("No observations for this symbol/window.")
+        elif df_apy.empty:
+            st.info("No venues selected.")
+        else:
+            fig_apy = px.line(
+                df_apy, x="ts_utc", y="apy_pct", color="venue_label",
+                title=f"{symbol} — Annualized APY (%) — comparable across all venues",
+                labels={"ts_utc": "Time (UTC)", "apy_pct": "Annualized APY (%)", "venue_label": "Venue"},
+            )
+            fig_apy.update_layout(
+                hovermode="x unified",
+                xaxis=dict(rangeslider=dict(visible=True), type="date"),
+            )
+            st.plotly_chart(fig_apy, width="stretch")
 
-                if df_bot.empty:
-                    st.info("Bottom chart: no venues selected (or no data).")
-                else:
-                    fig2 = px.line(
-                        df_bot, x="ts_utc", y="funding_rate", color="venue_label",
-                        title=f"{symbol} — Raw per-epoch funding rate (magnitudes not comparable across funding-cycle lengths)",
-                        labels={"ts_utc": "Time (UTC)", "funding_rate": "Per-epoch rate", "venue_label": "Venue"},
-                    )
-                    fig2.update_layout(hovermode="x unified")
-                    st.plotly_chart(fig2, width="stretch")
+        # ---- Raw per-epoch rate ----
+        st.subheader("Raw per-epoch funding rate")
+        st.multiselect(
+            "Venues",
+            list(VENUES.keys()),
+            default=list(VENUES.keys()),
+            key="chart_venues_rate",
+        )
+        if df.empty:
+            st.info("No observations for this symbol/window.")
+        elif df_rate.empty:
+            st.info("No venues selected.")
+        else:
+            fig_rate = px.line(
+                df_rate, x="ts_utc", y="funding_rate", color="venue_label",
+                title=f"{symbol} — Raw per-epoch rate (magnitudes not comparable across funding-cycle lengths)",
+                labels={"ts_utc": "Time (UTC)", "funding_rate": "Per-epoch rate", "venue_label": "Venue"},
+            )
+            fig_rate.update_layout(hovermode="x unified")
+            st.plotly_chart(fig_rate, width="stretch")
