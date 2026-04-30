@@ -212,6 +212,14 @@ with tab_anom:
                 "persistence_count":   st.column_config.NumberColumn("Cycles held"),
                 "avg_apy_pct":         COL_PCT_SIGNED("Avg Annualized APY"),
                 "max_abs_apy_pct":     COL_PCT_UNSIGNED("Peak |APY|"),
+                "predicted_apy_pct":   st.column_config.NumberColumn(
+                    "Predicted next-epoch APY", format="%+.1f%%",
+                    help=(
+                        "Annualized APY using the venue's predicted next-epoch funding rate "
+                        "(where exposed). Compare to Avg/Peak to anticipate flips before the "
+                        "next settlement. NULL if the venue doesn't publish a forecast."
+                    ),
+                ),
                 "interval_h":          st.column_config.NumberColumn("Interval (h)"),
                 "volume_24h_usd":      COL_USD("24h Volume"),
                 "open_interest_usd":   COL_USD("Open Interest"),
@@ -279,12 +287,13 @@ with tab_be:
     c4, c5, c6 = st.columns(3)
     with c4:
         max_abs_entry_basis_bps = st.number_input(
-            "Max |entry basis| (bps)",
-            min_value=0.0, value=100.0, step=10.0,
+            "Max |entry basis| (bps) — 0 disables",
+            min_value=0.0, value=0.0, step=10.0,
             help=(
-                "Excludes pairs where the cross-venue mark spread exceeds this threshold. "
-                "Spreads above ~100 bps almost always indicate stale prices or illiquid discovery, "
-                "not real arb. Lower (e.g. 20 bps) if you only want tightly-tradeable basis."
+                "Optional. **0 = filter disabled**, all pairs shown. Set a value to exclude "
+                "rows where |entry basis| exceeds it; e.g. 100 to drop pairs with mark spreads "
+                "above 1% (usually stale prices or illiquid discovery), or 20 if you only want "
+                "tightly-tradeable basis."
             ),
             key="be_max_abs_entry_basis",
         )
@@ -319,7 +328,19 @@ with tab_be:
                 "symbol_canonical":    st.column_config.TextColumn("Symbol"),
                 "long_venue":          st.column_config.TextColumn("Long on"),
                 "short_venue":         st.column_config.TextColumn("Short on"),
-                "spread_apy_pct":      COL_PCT_UNSIGNED("Spread APY"),
+                "spread_apy_pct":      st.column_config.NumberColumn(
+                    "Spread APY", format="%.1f%%",
+                    help="Current annualized APY gap (short_APY − long_APY).",
+                ),
+                "predicted_spread_apy_pct": st.column_config.NumberColumn(
+                    "Predicted next-epoch spread APY", format="%.1f%%",
+                    help=(
+                        "Same calculation as Spread APY but using each leg's predicted next-epoch "
+                        "funding rate. If much smaller than Spread APY, the spread is expected to "
+                        "compress next cycle — heads-up before deploying. NULL if either venue "
+                        "doesn't publish a predicted rate."
+                    ),
+                ),
                 "short_interval_h":    st.column_config.NumberColumn("Short int. (h)"),
                 "long_interval_h":     st.column_config.NumberColumn("Long int. (h)"),
                 "interval_mismatch":   st.column_config.CheckboxColumn("Interval mismatch"),
@@ -330,8 +351,22 @@ with tab_be:
                     help=(
                         "Cross-venue mark spread, in basis points (1 bp = 0.01%). "
                         "Positive = favorable (sell high, buy low). Negative = you pay the spread. "
-                        "Healthy liquid pairs sit at 1–20 bps; larger values are filtered out by Max |entry basis|."
+                        "Healthy liquid pairs sit at 1–20 bps; large values usually mean stale "
+                        "prices on one venue or illiquid discovery — not a real arb."
                     ),
+                ),
+                "basis_stddev_bps":    st.column_config.NumberColumn(
+                    "Basis volatility (1h, bps σ)", format="%.1f",
+                    help=(
+                        "Stddev of the cross-venue mark spread over the last 1h of cycles. "
+                        "Low (≲ 5 bps) = stable basis, the snapshot above is a good proxy for "
+                        "what you'll fill at. High (≳ 20 bps) = basis is bouncing — expect "
+                        "slippage between scan and engine execution."
+                    ),
+                ),
+                "basis_samples":       st.column_config.NumberColumn(
+                    "σ samples", format="%d",
+                    help="Number of cycles in the volatility window. Low (≲3) = stddev is noisy.",
                 ),
                 "breakeven_epochs":    st.column_config.NumberColumn(
                     "Breakeven (epochs)", format="%.2f",
