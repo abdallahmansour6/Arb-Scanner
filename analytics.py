@@ -117,14 +117,23 @@ def breakeven_epochs(
     return sql, [min_volume_usd, min_abs_delta_apy_pct]
 
 
-def historical_funding(symbol: str, exchanges: list[str]):
+def historical_funding(symbol: str, exchanges: list[str], hours_back: int | None = None):
+    """If hours_back is None, returns the full history; otherwise restricts to
+    the trailing window relative to the dataset's most recent timestamp."""
     placeholders = ",".join(["?"] * len(exchanges))
+    if hours_back is not None:
+        time_clause = (
+            f"AND ts_utc >= (SELECT MAX(ts_utc) FROM funding) - INTERVAL {int(hours_back)} HOUR"
+        )
+    else:
+        time_clause = ""
     sql = f"""
     SELECT ts_utc, exchange, funding_rate, apy_norm, mark_price,
            volume_24h_usd, open_interest_usd
     FROM funding
     WHERE symbol_canonical = ?
       AND exchange IN ({placeholders})
+      {time_clause}
     ORDER BY ts_utc;
     """
     return sql, [symbol, *exchanges]

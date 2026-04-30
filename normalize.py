@@ -81,12 +81,91 @@ def _to_dt(ms: int | None) -> datetime | None:
     return datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
 
 
+def _f(x) -> float | None:
+    if x is None:
+        return None
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return None
+
+
+def _mul(*xs) -> float | None:
+    out = 1.0
+    for x in xs:
+        if x is None:
+            return None
+        out *= x
+    return out
+
+
+def _gate_oi(info: dict, mark: float | None, mkt: dict | None) -> float | None:
+    """gate.io reports OI as contract count; convert via contractSize × mark."""
+    contracts = _f(info.get("total_size"))
+    if contracts is None or mark is None:
+        return None
+    cs = _f((mkt or {}).get("contractSize"))
+    if cs is None:
+        cs = 1.0
+    return contracts * cs * mark
+
+
+# Per-venue OI extractor: receives the ticker `info` blob, the mark price,
+# and the market metadata. Returns USD-denominated OI, or None.
+# Field names sourced from a one-shot probe of each venue's ticker.info.
+_OI_EXTRACTORS: dict = {
+    "bitget":  lambda info, mark, mkt: _mul(_f(info.get("holdingAmount")), mark),
+    "bitmart": lambda info, mark, mkt: (
+        _f(info.get("open_interest_value"))
+        or _mul(_f(info.get("open_interest")), mark)
+    ),
+    "bybit":   lambda info, mark, mkt: (
+        _f(info.get("openInterestValue"))
+        or _mul(_f(info.get("openInterest")), mark)
+    ),
+    "coinex":  lambda info, mark, mkt: _mul(_f(info.get("open_interest_volume")), mark),
+    "gate":    _gate_oi,
+    "mexc":    lambda info, mark, mkt: _mul(_f(info.get("holdVol")), mark),
+    "phemex":  lambda info, mark, mkt: _mul(_f(info.get("openInterestRv")), mark),
+}
+
+
+def _resolve_volume_24h_usd(ticker: dict | None, mark: float | None) -> float | None:
+    """Prefer quoteVolume (USDT-quoted -> USD); fall back to baseVolume × mark."""
+    if not ticker:
+        return None
+    qv = _f(ticker.get("quoteVolume"))
+    if qv is not None:
+        return qv
+    bv = _f(ticker.get("baseVolume"))
+    if bv is not None and mark is not None:
+        return bv * mark
+    return None
+
+
+def _resolve_oi_usd(
+    exchange: str,
+    ticker: dict | None,
+    market: dict | None,
+    mark: float | None,
+    batch_oi_usd: float | None,
+) -> float | None:
+    """Prefer batch fetchOpenInterests; fall back to per-venue ticker.info extraction."""
+    if batch_oi_usd is not None:
+        return batch_oi_usd
+    extractor = _OI_EXTRACTORS.get(exchange)
+    if extractor is None or not ticker:
+        return None
+    return extractor(ticker.get("info") or {}, mark, market)
+
+
 def normalize(
     exchange: str,
     cycle_ts: datetime,
     fr: dict,
     ticker: dict | None,
-    open_interest_usd: float | None,
+    market: dict | None,
+    batch_oi_usd: float | None,
 ) -> dict | None:
     """Return a canonical row, or None if the observation is too sparse to keep."""
     symbol = fr.get("symbol")
@@ -95,8 +174,7 @@ def normalize(
         return None
 
     interval_h = detect_interval_h(fr)
-    mark = fr.get("markPrice") or (ticker or {}).get("last")
-    quote_vol = (ticker or {}).get("quoteVolume")  # USDT-quoted -> USD-equivalent
+    mark = _f(fr.get("markPrice")) or _f((ticker or {}).get("last"))
 
     return {
         "ts_utc":             cycle_ts,
@@ -106,18 +184,9 @@ def normalize(
         "funding_interval_h": interval_h,
         "predicted_rate":     _f(fr.get("nextFundingRate")),
         "next_funding_ts":    _to_dt(fr.get("nextFundingTimestamp")),
-        "mark_price":         _f(mark),
+        "mark_price":         mark,
         "index_price":        _f(fr.get("indexPrice")),
-        "open_interest_usd":  _f(open_interest_usd),
-        "volume_24h_usd":     _f(quote_vol),
+        "open_interest_usd":  _resolve_oi_usd(exchange, ticker, market, mark, batch_oi_usd),
+        "volume_24h_usd":     _resolve_volume_24h_usd(ticker, mark),
         "apy_norm":           compute_apy_norm(float(rate), interval_h),
     }
-
-
-def _f(x) -> float | None:
-    if x is None:
-        return None
-    try:
-        return float(x)
-    except (TypeError, ValueError):
-        return None

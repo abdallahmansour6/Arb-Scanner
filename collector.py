@@ -93,7 +93,12 @@ async def fetch_venue(canonical: str, cfg: dict, cycle_ts: datetime) -> list[dic
 
         rows: list[dict] = []
         for symbol, fr in funding_rates.items():
-            row = normalize(canonical, cycle_ts, fr, tickers.get(symbol), oi_map.get(symbol))
+            row = normalize(
+                canonical, cycle_ts, fr,
+                tickers.get(symbol),
+                client.markets.get(symbol),
+                oi_map.get(symbol),
+            )
             if row is not None:
                 rows.append(row)
         log.info("venue %s: %d obs in %.1fs (%d markets)",
