@@ -6,11 +6,16 @@ Run:
 Single-operator, localhost-bound. Each tab owns the filters that affect it.
 """
 
+import logging
 from datetime import datetime, timezone
 
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+
+# VS Code's port-forward probes and stray browser preflights surface as Tornado
+# `Invalid HTTP request received` warnings. They're benign — silence them.
+logging.getLogger("tornado.general").setLevel(logging.ERROR)
 
 import analytics
 from config import (
@@ -129,8 +134,10 @@ with tab_delta:
             "Minimum Open Interest (USD)",
             min_value=0, value=0, step=100_000, format="%d",
             help=(
-                "**NULL-tolerant** — pairs from the 4 venues that don't expose OI (binance, bingx, "
-                "blofin, xt) still pass; only non-NULL OI values are checked against the threshold."
+                "**NULL-tolerant** — rows where OI is NULL (the 4 venues that don't expose OI: "
+                "binance, bingx, blofin, xt) PASS this filter; only non-NULL values are checked. "
+                "When you sort the OI column, NULL values always go to the bottom regardless of "
+                "asc/desc direction."
             ),
             key="delta_min_oi",
         )
@@ -175,8 +182,10 @@ with tab_anom:
             "Minimum Open Interest (USD)",
             min_value=0, value=0, step=100_000, format="%d",
             help=(
-                "**NULL-tolerant** — pairs from venues that don't report OI "
-                "(binance, bingx, blofin, xt) still pass."
+                "**NULL-tolerant** — rows where Open Interest is NULL (the 4 venues that don't "
+                "expose OI: binance, bingx, blofin, xt) PASS this filter — they're never "
+                "excluded by the threshold. When you click the OI column header to sort, "
+                "NULL values always go to the bottom (regardless of asc/desc direction)."
             ),
             key="anom_min_oi",
         )
@@ -215,9 +224,12 @@ with tab_anom:
                 "predicted_apy_pct":   st.column_config.NumberColumn(
                     "Predicted next-epoch APY", format="%+.1f%%",
                     help=(
-                        "Annualized APY using the venue's predicted next-epoch funding rate "
-                        "(where exposed). Compare to Avg/Peak to anticipate flips before the "
-                        "next settlement. NULL if the venue doesn't publish a forecast."
+                        "Annualized APY using the venue's predicted next-epoch funding rate. "
+                        "Compare to Avg/Peak to anticipate flips before the next settlement.\n\n"
+                        "**Mostly NULL by design** — most exchanges don't publish a public "
+                        "next-rate forecast. Currently populated for: bitmart and phemex (via "
+                        "their native batch endpoints), plus any venue whose ccxt funding-rate "
+                        "response happens to include `nextFundingRate`. NULL otherwise."
                     ),
                 ),
                 "interval_h":          st.column_config.NumberColumn("Interval (h)"),
@@ -337,8 +349,11 @@ with tab_be:
                     help=(
                         "Same calculation as Spread APY but using each leg's predicted next-epoch "
                         "funding rate. If much smaller than Spread APY, the spread is expected to "
-                        "compress next cycle — heads-up before deploying. NULL if either venue "
-                        "doesn't publish a predicted rate."
+                        "compress next cycle — heads-up before deploying.\n\n"
+                        "**Mostly NULL by design** — most exchanges don't publish a public "
+                        "next-rate forecast. Currently populated for: bitmart and phemex (via "
+                        "their native batch endpoints), plus any venue whose ccxt funding-rate "
+                        "response happens to include `nextFundingRate`. NULL otherwise."
                     ),
                 ),
                 "short_interval_h":    st.column_config.NumberColumn("Short int. (h)"),
@@ -349,24 +364,34 @@ with tab_be:
                 "entry_basis_bps":     st.column_config.NumberColumn(
                     "Entry basis (bps)", format="%+.1f",
                     help=(
-                        "Cross-venue mark spread, in basis points (1 bp = 0.01%). "
-                        "Positive = favorable (sell high, buy low). Negative = you pay the spread. "
-                        "Healthy liquid pairs sit at 1–20 bps; large values usually mean stale "
-                        "prices on one venue or illiquid discovery — not a real arb."
+                        "Cross-venue mark spread, in basis points (1 bp = 0.01%). Sign convention:\n"
+                        "  + (positive) = FAVORABLE entry — short-leg's mark is above long-leg's, so "
+                        "you'd sell at the higher price and buy at the lower one.\n"
+                        "  − (negative) = UNFAVORABLE entry — you pay the spread on entry, expecting "
+                        "to recoup it on convergence at exit.\n\n"
+                        "Most extreme-funding pairs cluster on one sign because funding and price "
+                        "tend to correlate. To surface the other sign, lower Min spread APY or sort "
+                        "this column ascending."
                     ),
                 ),
                 "basis_stddev_bps":    st.column_config.NumberColumn(
-                    "Basis volatility (1h, bps σ)", format="%.1f",
+                    "Basis 1h σ (bps)", format="%.1f",
                     help=(
-                        "Stddev of the cross-venue mark spread over the last 1h of cycles. "
-                        "Low (≲ 5 bps) = stable basis, the snapshot above is a good proxy for "
-                        "what you'll fill at. High (≳ 20 bps) = basis is bouncing — expect "
-                        "slippage between scan and engine execution."
+                        "How much the entry basis has bounced around in the last hour. "
+                        "Computed as the standard deviation of the cross-venue mark spread sampled "
+                        "at each cycle (so each sample is one cycle's `Entry basis (bps)` at that "
+                        "moment).\n\n"
+                        "  ≲ 5 bps σ = stable basis. The Entry basis (bps) above is a reliable "
+                        "estimate of what you'll fill at when the engine executes.\n"
+                        "  5–20 bps σ = some movement; treat the snapshot as approximate.\n"
+                        "  ≳ 20 bps σ = basis is bouncing significantly. Plan for the actual fill "
+                        "to differ — and check the σ samples count to confirm the stddev isn't "
+                        "based on too few cycles to be meaningful."
                     ),
                 ),
                 "basis_samples":       st.column_config.NumberColumn(
                     "σ samples", format="%d",
-                    help="Number of cycles in the volatility window. Low (≲3) = stddev is noisy.",
+                    help="Number of cycles in the 1h volatility window. Below ~3, the stddev is statistically noisy — interpret with caution.",
                 ),
                 "breakeven_epochs":    st.column_config.NumberColumn(
                     "Breakeven (epochs)", format="%.2f",
@@ -414,21 +439,28 @@ with tab_chart:
             )
             hours_back = period_options[period_label]
 
-        venues = st.multiselect(
-            "Venues",
+        venues_top = st.multiselect(
+            "Venues for top chart (Annualized APY)",
             list(VENUES.keys()),
             default=list(VENUES.keys()),
-            key="chart_venues",
+            key="chart_venues_top",
+        )
+        venues_bottom = st.multiselect(
+            "Venues for bottom chart (Raw per-epoch rate)",
+            list(VENUES.keys()),
+            default=list(VENUES.keys()),
+            key="chart_venues_bottom",
         )
 
-        if symbol and venues:
-            sql, params = analytics.historical_funding(symbol, venues, hours_back)
+        union_venues = sorted(set(venues_top) | set(venues_bottom))
+        if symbol and union_venues:
+            sql, params = analytics.historical_funding(symbol, union_venues, hours_back)
             df = cached_query(sql, tuple(params))
             if df.empty:
                 st.info("No observations for this symbol/venue/window combination.")
             else:
                 df["apy_pct"] = df["apy_norm"] * 100
-                # Annotate venue with its funding interval (mode within the window)
+                # Annotate venue with its funding interval (mode within the window).
                 interval_per_venue = (
                     df.dropna(subset=["funding_interval_h"])
                       .groupby("exchange")["funding_interval_h"]
@@ -439,21 +471,30 @@ with tab_chart:
                     lambda e: f"{e} ({interval_per_venue.get(e)}h)" if interval_per_venue.get(e) else e
                 )
 
-                fig = px.line(
-                    df, x="ts_utc", y="apy_pct", color="venue_label",
-                    title=f"{symbol} — Annualized APY (%) — comparable across all venues",
-                    labels={"ts_utc": "Time (UTC)", "apy_pct": "Annualized APY (%)", "venue_label": "Venue"},
-                )
-                fig.update_layout(
-                    hovermode="x unified",
-                    xaxis=dict(rangeslider=dict(visible=True), type="date"),
-                )
-                st.plotly_chart(fig, width="stretch")
+                df_top = df[df["exchange"].isin(venues_top)] if venues_top else df.iloc[0:0]
+                df_bot = df[df["exchange"].isin(venues_bottom)] if venues_bottom else df.iloc[0:0]
 
-                fig2 = px.line(
-                    df, x="ts_utc", y="funding_rate", color="venue_label",
-                    title=f"{symbol} — Raw per-epoch funding rate (NOT comparable across intervals)",
-                    labels={"ts_utc": "Time (UTC)", "funding_rate": "Per-epoch rate", "venue_label": "Venue"},
-                )
-                fig2.update_layout(hovermode="x unified")
-                st.plotly_chart(fig2, width="stretch")
+                if df_top.empty:
+                    st.info("Top chart: no venues selected (or no data).")
+                else:
+                    fig = px.line(
+                        df_top, x="ts_utc", y="apy_pct", color="venue_label",
+                        title=f"{symbol} — Annualized APY (%) — comparable across all venues",
+                        labels={"ts_utc": "Time (UTC)", "apy_pct": "Annualized APY (%)", "venue_label": "Venue"},
+                    )
+                    fig.update_layout(
+                        hovermode="x unified",
+                        xaxis=dict(rangeslider=dict(visible=True), type="date"),
+                    )
+                    st.plotly_chart(fig, width="stretch")
+
+                if df_bot.empty:
+                    st.info("Bottom chart: no venues selected (or no data).")
+                else:
+                    fig2 = px.line(
+                        df_bot, x="ts_utc", y="funding_rate", color="venue_label",
+                        title=f"{symbol} — Raw per-epoch funding rate (magnitudes not comparable across funding-cycle lengths)",
+                        labels={"ts_utc": "Time (UTC)", "funding_rate": "Per-epoch rate", "venue_label": "Venue"},
+                    )
+                    fig2.update_layout(hovermode="x unified")
+                    st.plotly_chart(fig2, width="stretch")
