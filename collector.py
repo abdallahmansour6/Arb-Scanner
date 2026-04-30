@@ -20,11 +20,14 @@ log = logging.getLogger(__name__)
 def _is_target_market(m: dict) -> bool:
     """USDT-margined linear perpetual swaps.
 
-    Accepts either `quote == 'USDT'` (BTC/USDT:USDT) or `settle == 'USDT'`
-    (BTC/USD:USDT, used by venues like coinex for USD-quoted, USDT-settled
-    contracts — still a USDT-margined linear perp).
+    Accepts `quote == 'USDT'` or `settle == 'USDT'` (covers BTC/USD:USDT-style
+    contracts that are still USDT-margined linear perps). `active` is treated
+    permissively: only `False` excludes — `None` means the venue (e.g. coinex)
+    simply doesn't populate the field.
     """
-    if not (m.get("swap") and m.get("linear") and m.get("active", True)):
+    if not (m.get("swap") and m.get("linear")):
+        return False
+    if m.get("active") is False:
         return False
     return m.get("settle") == "USDT" or m.get("quote") == "USDT"
 
