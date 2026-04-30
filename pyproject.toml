@@ -20,3 +20,11 @@ research = [
     "scikit-learn",
     "statsmodels",
 ]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+# Flat scripts, not a library — disable package auto-discovery.
+[tool.setuptools]
+py-modules = []
