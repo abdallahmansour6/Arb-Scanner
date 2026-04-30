@@ -9,8 +9,13 @@ from __future__ import annotations
 from config import EPOCHS_PER_YEAR
 
 
-def cross_exchange_delta(min_volume_usd: float):
-    """For every symbol listed on >=2 venues, latest cross-venue APY-norm delta."""
+def cross_exchange_delta(min_volume_usd: float, min_oi_usd: float = 0.0):
+    """For every symbol listed on >=2 venues, latest cross-venue APY-norm delta.
+
+    The OI filter is NULL-tolerant: rows with NULL open_interest_usd pass through
+    (since 4 of our 14 venues don't expose OI). Only non-NULL values are compared
+    against the floor. Set min_oi_usd=0 to disable.
+    """
     sql = """
     WITH latest AS (
         SELECT symbol_canonical, exchange, ts_utc, funding_rate, apy_norm,
@@ -19,6 +24,7 @@ def cross_exchange_delta(min_volume_usd: float):
         FROM funding
         WHERE volume_24h_usd >= ?
           AND apy_norm IS NOT NULL
+          AND (open_interest_usd IS NULL OR open_interest_usd >= ?)
     )
     SELECT
         symbol_canonical,
@@ -37,11 +43,14 @@ def cross_exchange_delta(min_volume_usd: float):
     ORDER BY delta_apy_pct DESC
     LIMIT 200;
     """
-    return sql, [min_volume_usd]
+    return sql, [min_volume_usd, min_oi_usd]
 
 
-def anomaly_candidates(min_abs_apy_pct: float, min_volume_usd: float, min_persistence: int):
-    """Symbol-venue pairs where |APY_norm| has held above the floor for N consecutive obs."""
+def anomaly_candidates(min_abs_apy_pct: float, min_volume_usd: float, min_persistence: int, min_oi_usd: float = 0.0):
+    """Symbol-venue pairs where |APY_norm| has held above the threshold for N consecutive cycles.
+
+    OI filter is NULL-tolerant (rows with NULL open_interest_usd pass through).
+    """
     sql = """
     WITH recent AS (
         SELECT symbol_canonical, exchange, ts_utc, funding_rate, apy_norm,
@@ -50,6 +59,7 @@ def anomaly_candidates(min_abs_apy_pct: float, min_volume_usd: float, min_persis
         FROM funding
         WHERE volume_24h_usd >= ?
           AND apy_norm IS NOT NULL
+          AND (open_interest_usd IS NULL OR open_interest_usd >= ?)
     )
     SELECT
         symbol_canonical, exchange,
@@ -68,7 +78,7 @@ def anomaly_candidates(min_abs_apy_pct: float, min_volume_usd: float, min_persis
     LIMIT 200;
     """
     p = min_persistence
-    return sql, [min_volume_usd, min_abs_apy_pct, p, min_abs_apy_pct, p]
+    return sql, [min_volume_usd, min_oi_usd, min_abs_apy_pct, p, min_abs_apy_pct, p]
 
 
 def breakeven_epochs(
@@ -76,6 +86,7 @@ def breakeven_epochs(
     min_volume_usd: float,
     exit_basis_bps: float,
     taker_fee_bps: float,
+    min_oi_usd: float = 0.0,
 ):
     """Rank candidate venue-pairs by E_BE = (basis_cost + fee_cost) / yield_per_epoch.
 
@@ -93,13 +104,14 @@ def breakeven_epochs(
     """
     sql = f"""
     WITH latest AS (
-        SELECT symbol_canonical, exchange, apy_norm, funding_rate,
-               funding_interval_h, mark_price, volume_24h_usd,
+        SELECT symbol_canonical, exchange, ts_utc, apy_norm, funding_rate,
+               funding_interval_h, mark_price, volume_24h_usd, open_interest_usd,
                ROW_NUMBER() OVER (PARTITION BY symbol_canonical, exchange ORDER BY ts_utc DESC) AS rn
         FROM funding
         WHERE volume_24h_usd >= ?
           AND apy_norm IS NOT NULL
           AND mark_price IS NOT NULL
+          AND (open_interest_usd IS NULL OR open_interest_usd >= ?)
     ),
     snap AS (SELECT * FROM latest WHERE rn = 1),
     pairs AS (
@@ -113,7 +125,8 @@ def breakeven_epochs(
             s.funding_interval_h AS short_interval_h,
             l.mark_price     AS long_mark,
             s.mark_price     AS short_mark,
-            LEAST(s.volume_24h_usd, l.volume_24h_usd) AS min_volume_24h_usd
+            LEAST(s.volume_24h_usd, l.volume_24h_usd) AS min_volume_24h_usd,
+            LEAST(s.ts_utc, l.ts_utc)                 AS latest_obs
         FROM snap s
         JOIN snap l
           ON s.symbol_canonical = l.symbol_canonical
@@ -138,13 +151,14 @@ def breakeven_epochs(
             + 4.0 * {taker_fee_bps}
         ) / NULLIF(10000.0 * (short_apy - long_apy) * short_interval_h / {EPOCHS_PER_YEAR}, 0)
                                                                           AS breakeven_epochs,
-        min_volume_24h_usd
+        min_volume_24h_usd,
+        latest_obs
     FROM pairs
     WHERE 100.0 * (short_apy - long_apy) >= ?
     ORDER BY breakeven_epochs ASC NULLS LAST
     LIMIT 200;
     """
-    return sql, [min_volume_usd, min_spread_apy_pct]
+    return sql, [min_volume_usd, min_oi_usd, min_spread_apy_pct]
 
 
 def historical_funding(symbol: str, exchanges: list[str], hours_back: int | None = None):
@@ -158,8 +172,8 @@ def historical_funding(symbol: str, exchanges: list[str], hours_back: int | None
     else:
         time_clause = ""
     sql = f"""
-    SELECT ts_utc, exchange, funding_rate, apy_norm, mark_price,
-           volume_24h_usd, open_interest_usd
+    SELECT ts_utc, exchange, funding_rate, apy_norm, funding_interval_h,
+           mark_price, volume_24h_usd, open_interest_usd
     FROM funding
     WHERE symbol_canonical = ?
       AND exchange IN ({placeholders})

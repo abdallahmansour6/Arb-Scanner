@@ -113,13 +113,25 @@ with tab_delta:
         "**Δ APY** is the gap between the highest and lowest annualized APY across those venues — "
         "the raw size of a potential arb opportunity. Long the venue with low/negative APY, short the high one."
     )
-    min_vol_delta = st.number_input(
-        "Minimum 24h volume on each leg (USD)",
-        min_value=0, value=DEFAULT_MIN_VOLUME_24H_USD, step=100_000, format="%d",
-        help="Excludes pairs where either leg lacks the notional liquidity to be a viable arb leg.",
-        key="delta_min_vol",
-    )
-    sql, params = analytics.cross_exchange_delta(min_vol_delta)
+    c1, c2 = st.columns(2)
+    with c1:
+        min_vol_delta = st.number_input(
+            "Minimum 24h volume on each leg (USD)",
+            min_value=0, value=DEFAULT_MIN_VOLUME_24H_USD, step=100_000, format="%d",
+            help="Excludes pairs where either leg lacks the notional liquidity to be a viable arb leg.",
+            key="delta_min_vol",
+        )
+    with c2:
+        min_oi_delta = st.number_input(
+            "Minimum Open Interest (USD)",
+            min_value=0, value=0, step=100_000, format="%d",
+            help=(
+                "NULL-tolerant: rows where OI isn't reported (4/14 venues) pass through. "
+                "Only non-NULL OI values are checked against the threshold."
+            ),
+            key="delta_min_oi",
+        )
+    sql, params = analytics.cross_exchange_delta(min_vol_delta, min_oi_delta)
     df = cached_query(sql, tuple(params))
     if df.empty:
         st.info("No symbols meet the volume threshold yet.")
@@ -147,7 +159,7 @@ with tab_anom:
         "(usually data glitches or already-decayed transients) so you only see anomalies "
         "with enough lifespan to be deployable."
     )
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns(4)
     with c1:
         min_vol_anom = st.number_input(
             "Minimum 24h volume (USD)",
@@ -156,13 +168,20 @@ with tab_anom:
             key="anom_min_vol",
         )
     with c2:
+        min_oi_anom = st.number_input(
+            "Minimum Open Interest (USD)",
+            min_value=0, value=0, step=100_000, format="%d",
+            help="NULL-tolerant — pairs without OI data still pass.",
+            key="anom_min_oi",
+        )
+    with c3:
         min_abs_apy = st.number_input(
             "Minimum |Annualized APY| (%)",
             min_value=0.0, value=DEFAULT_MIN_ABS_APY_PCT, step=10.0,
             help=APY_TOOLTIP,
             key="anom_min_apy",
         )
-    with c3:
+    with c4:
         persistence = st.slider(
             "Must hold for N consecutive cycles",
             min_value=1, max_value=20, value=DEFAULT_MIN_PERSISTENCE,
@@ -174,7 +193,7 @@ with tab_anom:
             key="anom_persistence",
         )
 
-    sql, params = analytics.anomaly_candidates(min_abs_apy, min_vol_anom, persistence)
+    sql, params = analytics.anomaly_candidates(min_abs_apy, min_vol_anom, persistence, min_oi_anom)
     df = cached_query(sql, tuple(params))
     if df.empty:
         st.info("No anomalies meet both thresholds and persistence — relax filters or wait for more cycles.")
@@ -214,7 +233,13 @@ with tab_be:
             "**E_BE** = round-trip cost / yield per epoch. **Negative E_BE** means the entry is "
             "favorable enough that you profit instantly — no holding required."
         )
-    c1, c2, c3, c4 = st.columns(4)
+    st.caption(
+        f":{'green' if age_min <= 15 else 'orange' if age_min <= 30 else 'red'}"
+        f"[●] Mark prices used for entry-basis are from the **{age_min:.1f}-min-old** cycle. "
+        "Stale mark = stale basis. Watch this if cycle drifts."
+    )
+
+    c1, c2, c3, c4, c5 = st.columns(5)
     with c1:
         min_vol_be = st.number_input(
             "Minimum 24h volume on each leg (USD)",
@@ -222,22 +247,29 @@ with tab_be:
             key="be_min_vol",
         )
     with c2:
+        min_oi_be = st.number_input(
+            "Minimum Open Interest (USD)",
+            min_value=0, value=0, step=100_000, format="%d",
+            help="NULL-tolerant — pairs without OI data still pass.",
+            key="be_min_oi",
+        )
+    with c3:
         min_spread_apy = st.number_input(
             "Minimum spread APY (%)",
             min_value=0.0, value=DEFAULT_MIN_SPREAD_APY_PCT, step=10.0,
             help="Cross-venue annualized APY gap required to even consider the pair.",
             key="be_min_spread",
         )
-    with c3:
+    with c4:
         taker_fee_bps = st.number_input(
             "Taker fee per side (bps)",
             value=DEFAULT_TAKER_FEE_BPS, step=0.5, min_value=0.0,
             help="Used 4× in the cost (entry + exit, both legs).",
             key="be_taker_fee",
         )
-    with c4:
+    with c5:
         exit_basis_bps = st.number_input(
-            "Residual exit basis assumption (bps)",
+            "Residual exit basis (bps)",
             value=DEFAULT_EXIT_BASIS_BPS, step=1.0,
             help=(
                 "Assumed bps of basis at unwind. 0 = full price convergence (default). "
@@ -246,7 +278,7 @@ with tab_be:
             key="be_exit_basis",
         )
 
-    sql, params = analytics.breakeven_epochs(min_spread_apy, min_vol_be, exit_basis_bps, taker_fee_bps)
+    sql, params = analytics.breakeven_epochs(min_spread_apy, min_vol_be, exit_basis_bps, taker_fee_bps, min_oi_be)
     df = cached_query(sql, tuple(params))
     if df.empty:
         st.info("No venue-pair candidates meet the spread threshold.")
@@ -269,6 +301,7 @@ with tab_be:
                     help="Negative values mean entry is favorable enough that you profit instantly.",
                 ),
                 "min_volume_24h_usd":  COL_USD("Min 24h Volume"),
+                "latest_obs":          COL_DT("Mark as of"),
             },
         )
 
