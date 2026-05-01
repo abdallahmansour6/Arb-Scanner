@@ -156,6 +156,20 @@ with tab_delta:
                 "long_venue":         st.column_config.TextColumn("Long on"),
                 "short_apy_pct":      COL_PCT_SIGNED("Short APY"),
                 "long_apy_pct":       COL_PCT_SIGNED("Long APY"),
+                "short_apy_stddev_pct": st.column_config.NumberColumn(
+                    "Short APY 1h σ", format="%.1f%%",
+                    help=(
+                        "Stddev of the SHORT venue's annualized APY over the last hour. "
+                        "Funding rates can move significantly between cycles, especially during anomaly "
+                        "spikes. **Low σ** (≲ 50%) = the rate has been stable; the snapshot above is "
+                        "reliable. **High σ** = the rate is bouncing wildly — by the time you execute, "
+                        "it may already differ substantially from what you see here."
+                    ),
+                ),
+                "long_apy_stddev_pct":  st.column_config.NumberColumn(
+                    "Long APY 1h σ", format="%.1f%%",
+                    help="Same as Short APY 1h σ but for the long-leg venue.",
+                ),
                 "min_volume_24h_usd": COL_USD("Min 24h Volume"),
                 "latest_obs":         COL_DT("Last update"),
             },
@@ -230,6 +244,15 @@ with tab_anom:
                         "next-rate forecast. Currently populated for: bitmart and phemex (via "
                         "their native batch endpoints), plus any venue whose ccxt funding-rate "
                         "response happens to include `nextFundingRate`. NULL otherwise."
+                    ),
+                ),
+                "apy_stddev_pct":      st.column_config.NumberColumn(
+                    "APY 1h σ", format="%.1f%%",
+                    help=(
+                        "Stddev of this (symbol, venue)'s annualized APY over the last hour. "
+                        "Pairs with high persistence + LOW σ are the cleanest anomalies — the rate "
+                        "has been extreme AND stable. High σ + high persistence = persistently "
+                        "anomalous but bouncing; less reliable for execution timing."
                     ),
                 ),
                 "interval_h":          st.column_config.NumberColumn("Interval (h)"),

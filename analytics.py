@@ -9,22 +9,35 @@ from __future__ import annotations
 from config import EPOCHS_PER_YEAR
 
 
-def cross_exchange_delta(min_volume_usd: float, min_oi_usd: float = 0.0):
+def cross_exchange_delta(min_volume_usd: float, min_oi_usd: float = 0.0,
+                         volatility_window_hours: int = 1):
     """For every symbol listed on >=2 venues, latest cross-venue APY-norm delta.
 
-    The OI filter is NULL-tolerant: rows with NULL open_interest_usd pass through
-    (since 4 of our 14 venues don't expose OI). Only non-NULL values are compared
-    against the floor. Set min_oi_usd=0 to disable.
+    OI filter is NULL-tolerant. Adds per-venue APY volatility (1h σ) so a stable
+    rate is visually distinguishable from a rate that's been bouncing — important
+    because the funding-rate snapshot can drift between scan and execution.
     """
-    sql = """
-    WITH latest AS (
-        SELECT symbol_canonical, exchange, ts_utc, funding_rate, apy_norm,
-               funding_interval_h, mark_price, volume_24h_usd, open_interest_usd,
-               ROW_NUMBER() OVER (PARTITION BY symbol_canonical, exchange ORDER BY ts_utc DESC) AS rn
+    sql = f"""
+    WITH stddev_window AS (
+        SELECT symbol_canonical, exchange,
+               STDDEV_SAMP(100.0 * apy_norm) AS apy_stddev_pct
         FROM funding
-        WHERE volume_24h_usd >= ?
+        WHERE ts_utc >= (SELECT MAX(ts_utc) FROM funding)
+                       - INTERVAL {int(volatility_window_hours)} HOUR
           AND apy_norm IS NOT NULL
-          AND (open_interest_usd IS NULL OR open_interest_usd >= ?)
+        GROUP BY symbol_canonical, exchange
+    ),
+    latest AS (
+        SELECT f.symbol_canonical, f.exchange, f.ts_utc, f.funding_rate, f.apy_norm,
+               f.funding_interval_h, f.mark_price, f.volume_24h_usd, f.open_interest_usd,
+               sw.apy_stddev_pct,
+               ROW_NUMBER() OVER (PARTITION BY f.symbol_canonical, f.exchange
+                                  ORDER BY f.ts_utc DESC) AS rn
+        FROM funding f
+        LEFT JOIN stddev_window sw USING (symbol_canonical, exchange)
+        WHERE f.volume_24h_usd >= ?
+          AND f.apy_norm IS NOT NULL
+          AND (f.open_interest_usd IS NULL OR f.open_interest_usd >= ?)
     )
     SELECT
         symbol_canonical,
@@ -34,6 +47,8 @@ def cross_exchange_delta(min_volume_usd: float, min_oi_usd: float = 0.0):
         ARG_MIN(exchange, apy_norm)                                      AS long_venue,
         100.0 * MAX(apy_norm)                                            AS short_apy_pct,
         100.0 * MIN(apy_norm)                                            AS long_apy_pct,
+        ARG_MAX(apy_stddev_pct, apy_norm)                                AS short_apy_stddev_pct,
+        ARG_MIN(apy_stddev_pct, apy_norm)                                AS long_apy_stddev_pct,
         MIN(volume_24h_usd)                                              AS min_volume_24h_usd,
         MAX(ts_utc)                                                      AS latest_obs
     FROM latest
@@ -46,13 +61,25 @@ def cross_exchange_delta(min_volume_usd: float, min_oi_usd: float = 0.0):
     return sql, [min_volume_usd, min_oi_usd]
 
 
-def anomaly_candidates(min_abs_apy_pct: float, min_volume_usd: float, min_persistence: int, min_oi_usd: float = 0.0):
+def anomaly_candidates(min_abs_apy_pct: float, min_volume_usd: float, min_persistence: int,
+                       min_oi_usd: float = 0.0, volatility_window_hours: int = 1):
     """Symbol-venue pairs where |APY_norm| has held above the threshold for N consecutive cycles.
 
     OI filter is NULL-tolerant (rows with NULL open_interest_usd pass through).
+    Adds per-(symbol, venue) APY volatility (1h σ) so a noisily-bouncing anomaly
+    is distinguishable from a stably-extreme one.
     """
     sql = f"""
-    WITH recent AS (
+    WITH stddev_window AS (
+        SELECT symbol_canonical, exchange,
+               STDDEV_SAMP(100.0 * apy_norm) AS apy_stddev_pct
+        FROM funding
+        WHERE ts_utc >= (SELECT MAX(ts_utc) FROM funding)
+                       - INTERVAL {int(volatility_window_hours)} HOUR
+          AND apy_norm IS NOT NULL
+        GROUP BY symbol_canonical, exchange
+    ),
+    recent AS (
         SELECT symbol_canonical, exchange, ts_utc, funding_rate, apy_norm,
                predicted_rate, funding_interval_h, volume_24h_usd, open_interest_usd,
                predicted_rate * ({EPOCHS_PER_YEAR}.0 / NULLIF(funding_interval_h, 0))
@@ -64,19 +91,23 @@ def anomaly_candidates(min_abs_apy_pct: float, min_volume_usd: float, min_persis
           AND (open_interest_usd IS NULL OR open_interest_usd >= ?)
     )
     SELECT
-        symbol_canonical, exchange,
-        COUNT(*) FILTER (WHERE 100.0 * ABS(apy_norm) >= ?)               AS persistence_count,
-        100.0 * AVG(apy_norm)                                            AS avg_apy_pct,
-        100.0 * MAX(ABS(apy_norm))                                       AS max_abs_apy_pct,
-        100.0 * ARG_MAX(predicted_apy_norm, ts_utc)                      AS predicted_apy_pct,
-        ANY_VALUE(funding_interval_h)                                    AS interval_h,
-        MIN(volume_24h_usd)                                              AS volume_24h_usd,
-        MIN(open_interest_usd)                                           AS open_interest_usd,
-        MAX(ts_utc)                                                      AS latest_obs
-    FROM recent
-    WHERE rn <= ?
-    GROUP BY symbol_canonical, exchange
-    HAVING COUNT(*) FILTER (WHERE 100.0 * ABS(apy_norm) >= ?) >= ?
+        r.symbol_canonical, r.exchange,
+        COUNT(*) FILTER (WHERE 100.0 * ABS(r.apy_norm) >= ?)             AS persistence_count,
+        100.0 * AVG(r.apy_norm)                                          AS avg_apy_pct,
+        100.0 * MAX(ABS(r.apy_norm))                                     AS max_abs_apy_pct,
+        100.0 * ARG_MAX(r.predicted_apy_norm, r.ts_utc)                  AS predicted_apy_pct,
+        ANY_VALUE(sw.apy_stddev_pct)                                     AS apy_stddev_pct,
+        ANY_VALUE(r.funding_interval_h)                                  AS interval_h,
+        MIN(r.volume_24h_usd)                                            AS volume_24h_usd,
+        MIN(r.open_interest_usd)                                         AS open_interest_usd,
+        MAX(r.ts_utc)                                                    AS latest_obs
+    FROM recent r
+    LEFT JOIN stddev_window sw
+      ON r.symbol_canonical = sw.symbol_canonical
+     AND r.exchange = sw.exchange
+    WHERE r.rn <= ?
+    GROUP BY r.symbol_canonical, r.exchange
+    HAVING COUNT(*) FILTER (WHERE 100.0 * ABS(r.apy_norm) >= ?) >= ?
     ORDER BY ABS(avg_apy_pct) DESC
     LIMIT 200;
     """
